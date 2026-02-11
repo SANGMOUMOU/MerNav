@@ -1,3 +1,7 @@
+import os
+os.environ['MAGNUM_DEVICE_ID'] = '0'
+os.environ['EGL_DEVICE_ID'] = '0'
+
 import argparse
 import yaml
 
@@ -5,6 +9,8 @@ from dotenv import load_dotenv
 from api import *
 from WMNav_agent import *
 from WMNav_env import *
+from MerNav_agent import *
+from MerNav_env import *
 from custom_agent import *
 from custom_env import *
 

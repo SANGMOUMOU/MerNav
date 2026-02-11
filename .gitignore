@@ -5,3 +5,6 @@ logs/
 .vscode/
 wandb/
 src/VLMnav.egg-info/
+NVIDIA-Linux-x86_64*
+10_nvidia.json
+src/WMNav.egg-info/

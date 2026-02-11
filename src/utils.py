@@ -324,9 +324,20 @@ def create_gif(image_dir, h, w, interval=600, agent_cls='ObjectNavAgent'):
         # Create the animation
         ani = animation.ArtistAnimation(fig, frames, interval=interval, blit=True)
 
-        # Save the animation
-        ani.save(f'{image_dir}/animation.gif', writer='imagemagick')
-        logging.info('GIF animation saved successfully!')
+        # Save the animation (with fallback to pillow if imagemagick fails)
+        gif_path = f'{image_dir}/animation.gif'
+        try:
+            ani.save(gif_path, writer='imagemagick')
+            logging.info('GIF animation saved successfully with imagemagick!')
+        except Exception as e:
+            logging.warning(f'Failed to save GIF with imagemagick: {e}')
+            logging.info('Attempting to save with pillow...')
+            try:
+                ani.save(gif_path, writer='pillow', fps=1000//interval)
+                logging.info('GIF animation saved successfully with pillow!')
+            except Exception as e2:
+                logging.error(f'Failed to save GIF with pillow: {e2}')
+                logging.error('GIF saving failed. Please install imagemagick or ensure pillow is up to date.')
 
         # Clear the frames list after saving the animation
         frames.clear()
@@ -373,9 +384,20 @@ def create_gif(image_dir, h, w, interval=600, agent_cls='ObjectNavAgent'):
         # Create the animation
         ani = animation.ArtistAnimation(fig, frames, interval=interval, blit=True)
 
-        # Save the animation
-        ani.save(f'{image_dir}/animation.gif', writer='imagemagick')
-        logging.info('GIF animation saved successfully!')
+        # Save the animation (with fallback to pillow if imagemagick fails)
+        gif_path = f'{image_dir}/animation.gif'
+        try:
+            ani.save(gif_path, writer='imagemagick')
+            logging.info('GIF animation saved successfully with imagemagick!')
+        except Exception as e:
+            logging.warning(f'Failed to save GIF with imagemagick: {e}')
+            logging.info('Attempting to save with pillow...')
+            try:
+                ani.save(gif_path, writer='pillow', fps=1000//interval)
+                logging.info('GIF animation saved successfully with pillow!')
+            except Exception as e2:
+                logging.error(f'Failed to save GIF with pillow: {e2}')
+                logging.error('GIF saving failed. Please install imagemagick or ensure pillow is up to date.')
 
         # Clear the frames list after saving the animation
         frames.clear()

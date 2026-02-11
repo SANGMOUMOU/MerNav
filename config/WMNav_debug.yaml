@@ -1,0 +1,46 @@
+agent_cfg:
+  clip_frac: 0.66
+  context_history: 0
+  default_action: 0.2
+  explore_bias: 4
+  image_edge_threshold: 0.04
+  map_scale: 100
+  max_action_dist: 1.7
+  min_action_dist: 0.5
+  navigability_height_threshold: 0.2
+  navigability_mode: depth_sensor
+  num_theta: 60
+  panoramic_padding: false
+  spacing_ratio: 360
+  stopping_action_dist: 1.5
+  turn_around_cooldown: 3
+  vlm_cfg:
+    model_cls: QwenVLM
+    model_kwargs:
+      model: Qwen/Qwen2.5-VL-7B-Instruct
+agent_cls: WMNavAgent
+env_cfg:
+  dataset: hm3d_v0.2
+  instance: 0
+  instances: 1
+  log_freq: 1
+  max_steps: 5
+  name: default
+  num_episodes: 1
+  parallel: false
+  port: 5000
+  split: val
+  success_threshold: 1.0
+env_cls: WMNavEnv
+sim_cfg:
+  agent_height: 0.88
+  agent_radius: 0.18
+  allow_slide: true
+  sensor_cfg:
+    fov: 79
+    height: 0.88
+    img_height: 480
+    img_width: 640
+    pitch: -0.25
+  use_goal_image_agent: false
+task: ObjectNav

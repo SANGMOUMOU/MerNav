@@ -1,6 +1,6 @@
 task: ObjectNav
-agent_cls: WMNavAgent
-env_cls: WMNavEnv
+agent_cls: MerNavAgent
+env_cls: MerNavEnv
 
 agent_cfg:
   navigability_mode: 'depth_sensor' # one of ['none' (ours w/o nav), 'depth_estimate' (ZoeDepth), 'segmentation' (Segformer), 'depth_sensor' (Ours)]
@@ -18,10 +18,24 @@ agent_cfg:
   navigability_height_threshold: 0.2 # threshold from the ground to consider navigable
   map_scale: 100 #pixels per meter
   vlm_cfg:
-    model_cls: GeminiVLM # [GeminiVLM, QwenVLM]
+    model_cls: QwenVLM # [GeminiVLM, QwenVLM]
     model_kwargs:
-      model: gemini-2.0-flash # [gemini-1.5-flash, gemini-1.5-pro, gemini-2.0-flash, Qwen/Qwen2.5-VL-3B-Instruct, Qwen/Qwen2.5-VL-7B-Instruct]
+      model: Qwen/Qwen2.5-VL-7B-Instruct # [gemini-1.5-flash, gemini-1.5-pro, gemini-2.0-flash, Qwen/Qwen2.5-VL-3B-Instruct, Qwen/Qwen2.5-VL-7B-Instruct]
   panoramic_padding: False
+  # 记忆系统配置（参考 EverMemOS 持久化策略）
+  memory_cfg:
+    # 持久化目录（默认为 $LOG_DIR/memory_db，会自动创建）
+    persist_dir: null  # null 表示使用 MEMORY_PERSIST_DIR 默认值
+    # 是否启用在线学习（运行时自动补充新发现的场景-物体关系）
+    auto_update: true
+    # 短期记忆历史长度（保留最近 N 步的 MemCell）
+    stm_history_length: 5
+    # 最大 frontier 节点数
+    max_frontier_nodes: 50
+    # 停滞检测配置
+    stagnation_window: 5          # 停滞检测窗口（步数）
+    stagnation_dist_threshold: 0.5  # 位移阈值（米），低于此值视为停滞
+    cognitive_stagnation_window: 8  # 认知停滞窗口（步数）
 
 sim_cfg:
   agent_height: 0.88
@@ -36,7 +50,7 @@ sim_cfg:
     img_width: 640
 
 env_cfg:
-  num_episodes: 1
+  num_episodes: 100000 # 设为足够大的数以覆盖整个验证集(实际会被总episode数截断)
   max_steps: 40
   log_freq: 1
   split: val

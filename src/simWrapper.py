@@ -48,6 +48,8 @@ class SimWrapper:
         backend_cfg.scene_id = cfg['scene_path']
         backend_cfg.scene_dataset_config_file = cfg['scene_config']
         backend_cfg.enable_physics = True
+        backend_cfg.gpu_device_id = 0
+        backend_cfg.enable_gfx_replay_save = False
 
         # Agent configuration
         agent_cfg = habitat_sim.agent.AgentConfiguration()
