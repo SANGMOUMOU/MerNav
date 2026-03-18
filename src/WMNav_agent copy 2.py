@@ -12,7 +12,7 @@ import json as _json
 from simWrapper import PolarAction
 from utils import *
 from api import *
-#带有记忆模块
+
 class Agent:
     def __init__(self, cfg: dict):
         pass

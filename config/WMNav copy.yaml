@@ -1,0 +1,77 @@
+task: ObjectNav
+agent_cls: WMNavAgent
+env_cls: WMNavEnv
+
+agent_cfg:
+  # ── 导航模式 ──
+  navigability_mode: 'depth_sensor'
+
+  # ── 传感器配置（agent 侧必须有） ──
+  sensor_cfg:
+    fov: 79
+    img_height: 480
+    img_width: 640
+
+  # ── 动作与导航参数 ──
+  context_history: 0
+  explore_bias: 4
+  max_action_dist: 1.7
+  min_action_dist: 0.5
+  clip_frac: 0.66
+  stopping_action_dist: 1.5
+  default_action: 0.2
+  spacing_ratio: 360
+  num_theta: 60
+  image_edge_threshold: 0.04
+  turn_around_cooldown: 3
+  navigability_height_threshold: 0.2
+  panoramic_padding: False
+
+  # ── 地图参数 ──
+  map_scale: 100        # pixels per meter
+  map_size: 5000        # LongTermMemory 栅格边长
+
+  # ── FrustumRaycaster 参数 ──
+  raycaster_max_range: 8.0   # 深度传感器最大有效距离（米）
+  raycaster_stride: 8        # 射线采样步长（值越大越快，精度越低）
+
+# ── ShortTermMemory（卡住检测）参数 ──
+  stm_window_size: 3         # 滑动窗口大小（步数）
+  stm_mild_threshold: 0.5      # 轻度卡住位移阈值（米）
+  stm_severe_threshold: 0.3    # 严重卡住位移阈值（米）
+  stm_mild_steps: 2            # 连续 N 步位移不足 → 轻度卡住
+  stm_severe_steps: 3          # 连续 N 步位移不足 → 严重卡住
+  stm_vo_radius: 5             # 虚拟障碍物半径（栅格格数）
+
+  # ── CommonsenseMemory（语义缓存）参数 ──
+  csm_ttl_seconds: 120.0   # 缓存条目存活时间（秒）
+  csm_max_entries: 32      # 最大缓存条目数
+
+  # ── VLM 配置 ──
+  vlm_cfg:
+    model_cls: QwenVLM
+    model_kwargs:
+      model: Qwen/Qwen2.5-VL-7B-Instruct
+sim_cfg:
+  agent_height: 0.88
+  agent_radius: 0.18
+  allow_slide: true
+  use_goal_image_agent: false
+  sensor_cfg:
+    height: 0.88
+    pitch: -0.25
+    fov: 79
+    img_height: 480
+    img_width: 640
+
+env_cfg:
+  num_episodes: 100000
+  max_steps: 40
+  log_freq: 1
+  split: val
+  success_threshold: 1.0
+  instances: 1
+  instance: 0
+  parallel: false
+  name: default
+  port: 5000

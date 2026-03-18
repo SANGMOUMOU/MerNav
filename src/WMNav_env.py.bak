@@ -16,7 +16,7 @@ from simWrapper import PolarAction, SimWrapper
 from WMNav_agent import *
 from custom_agent import *
 from utils import *
-#带有记忆模块
+
 class Env:
     """
     Base class for creating an environment for embodied navigation tasks.
@@ -81,59 +81,22 @@ class Env:
         Should be implemented in derived classes.
         """
         raise NotImplementedError
-    def _is_episode_completed(self, episode_ndx):
-        """检查某个 episode 是否已经成功完成（用于断点续跑）"""
-        episode = self.all_episodes[episode_ndx]
-        if 'hm3d' in self.cfg.get('dataset', ''):
-            f = episode['scene_id'].split('/')[1:]
-            scene_id = f[1][2:5]
-        elif 'mp3d' in self.cfg.get('dataset', ''):
-            scene_id = episode['scene_id'].split('/')[1]
-        else:
-            return False
 
-        curr_run_name = f"{episode_ndx}_{scene_id}"
-        pkl_path = os.path.join(os.environ.get("LOG_DIR"),f'{self.outer_run_name}/{self.inner_run_name}/{curr_run_name}/df_results.pkl')
-        if not os.path.exists(pkl_path):
-            return False
-        try:
-            df = pd.read_pickle(pkl_path)
-            if len(df) > 0 and 'done' in df.columns:
-                return bool(df.iloc[-1].get('done', False))
-        except Exception:
-            return False
-        return False
     def run_experiment(self):
-        instance_size = math.ceil(self.num_episodes / self.cfg['instances'])
+        """
+        Runs the experiment by iterating over episodes.
+        """
+        instance_size = math.ceil(self.num_episodes / self.cfg['instances'])  # 1000
         start_ndx = self.cfg['instance'] * instance_size
         end_ndx = self.num_episodes
 
-        # 支持从指定 episode 开始，并可选过滤 scene_id
-        skip_to = self.cfg.get('start_episode', None)
-        target_scene = self.cfg.get('target_scene_id', None)
-
         for episode_ndx in range(start_ndx, min(start_ndx + self.cfg['num_episodes'], end_ndx)):
 
-            # 跳过指定 episode 之前的任务
-            if skip_to is not None and episode_ndx < skip_to:
-                continue
-
-            # 跳过不匹配的 scene_id
-            if target_scene is not None:
-                episode = self.all_episodes[episode_ndx]
-                scene_id = self._extract_scene_id(episode)
-                if scene_id != str(target_scene):
-                    continue
-
-            if self.cfg.get('resume', False) and self._is_episode_completed(episode_ndx):
-                logging.info(f'Episode {episode_ndx} already completed, skipping.')
-                continue
-            
             self.wandb_log_data = {
-                'episode_ndx': episode_ndx,
-                'instance': self.inner_run_name,
-                'total_episodes': self.cfg['instances'] * self.cfg['num_episodes'],
-                'task': self.task,
+                'episode_ndx': episode_ndx,  # 0
+                'instance': self.inner_run_name,  # 0_of_1
+                'total_episodes': self.cfg['instances'] * self.cfg['num_episodes'],  # 1
+                'task': self.task,  # ObjectNav
                 'task_data': {},
                 'spl': 0,
                 'goal_reached': False
@@ -145,15 +108,6 @@ class Env:
                 log_exception(e)
                 self.simWrapper.reset()
 
-    def _extract_scene_id(self, episode: dict) -> str:
-        """从 episode 中提取 scene_id"""
-        dataset = self.cfg.get('dataset', '')
-        if 'hm3d' in dataset:
-            f = episode['scene_id'].split('/')[1:]
-            return f[1][2:5]
-        elif 'mp3d' in dataset:
-            return episode['scene_id'].split('/')[1]
-        return ''
 
     def _run_episode(self, episode_ndx: int):
         """
@@ -321,7 +275,7 @@ class WMNavEnv(Env):
             objnav_path = 'objectnav_hm3d_v1'
         elif self.cfg['dataset']  == 'hm3d_v0.2':
             scene_config_path = 'hm3d_v0.2/hm3d_annotated_basis.scene_dataset_config.json'
-            objnav_path = 'objectnav_hm3d_v0.2'
+            objnav_path = 'objectnav_hm3d_v2'
         elif self.cfg['dataset']  == 'mp3d':
             scene_config_path = 'mp3d/mp3d_annotated_basis.scene_dataset_config.json'
             objnav_path = 'objectnav_mp3d'
@@ -383,28 +337,10 @@ class WMNavEnv(Env):
         self.init_pos = np.array(episode['start_position'])
         self.simWrapper.set_state(pos=self.init_pos, quat=episode['start_rotation'])
         self.curr_run_name = f"{episode_ndx}_{self.simWrapper.scene_id}"
-        # ===== 新增：清除当前 episode 的旧日志 =====
-        episode_log_dir = os.path.join(
-            os.environ.get("LOG_DIR"),
-            f'{self.outer_run_name}/{self.inner_run_name}/{self.curr_run_name}'
-        )
-        if os.path.exists(episode_log_dir):
-            import shutil
-            shutil.rmtree(episode_log_dir)
-            logging.info(f'已清除当前episode旧日志: {episode_log_dir}')
-    # ===== 新增结束 =====
+
         obs = self.simWrapper.step(PolarAction.null)
 
         self.previous_subtask = '{}'  # Initialize the last subtask with an empty dictionary
-
-        # ── 模块一: 任务初始化时获取语义先验 ──
-        if hasattr(self.agent, 'acquire_semantic_prior'):
-            self.agent.acquire_semantic_prior(self.current_episode['object'])  # Initialize the last subtask with an empty dictionary
-        # ── 经验知识库: 从磁盘加载目标物的历史经验 ──
-        if hasattr(self.agent, 'load_experience'):
-            self.agent.load_experience(self.current_episode['object'])
-
-        
         return obs
 
     def _step_env(self, obs: dict):
@@ -433,43 +369,9 @@ class WMNavEnv(Env):
         panoramic_image, explorable_value, reason = self.agent.make_curiosity_value(episode_images[-12:], self.current_episode['object'])
         goal_rotate, goal_reason = self.agent.update_curiosity_value(explorable_value, reason)
 
-        # ── 模块二: 更新工作记忆计数器 ──
-        if hasattr(self.agent, 'steps_since_door_entry'):
-            self.agent.steps_since_door_entry += 1
-
-        # ── 模块三: 记录位置 & 困死检测 ──
-        if hasattr(self.agent, 'update_position_history'):
-            self.agent.update_position_history(obs['agent_state'])
-        if hasattr(self.agent, 'detect_stuck'):
-            _stuck = self.agent.detect_stuck()
-            if _stuck == 2:
-                self.agent.init_global_recovery()
-                logging.info("[Env] Global recovery triggered")
-
-        # ── 模块二: 区域穷尽检测 ──
-        if hasattr(self.agent, 'check_room_exhaustion'):
-            self.agent.check_room_exhaustion(obs['agent_state'])
-
-        # ── 模块三: 目标锚定偏置 ──
-        if hasattr(self.agent, 'apply_target_anchor_bias'):
-            self.agent.apply_target_anchor_bias(obs['agent_state'])
-
         direction_image = episode_images[-12:][goal_rotate]
         goal_flag, subtask = self.agent.make_plan(direction_image, self.previous_subtask, goal_reason, self.current_episode['object'])
         self.previous_subtask = subtask # update last subtask
-        # ── 模块二: 门记忆 & 场景检测 ──
-        if hasattr(self.agent, 'record_door_position'):
-            _subtask_lower = str(subtask).lower()
-            if any(kw in _subtask_lower for kw in ['door', 'hallway', 'corridor', 'entrance', 'opening']):
-                self.agent.record_door_position(obs['agent_state'])
-
-        if (hasattr(self.agent, 'steps_since_door_entry') and
-            self.agent.steps_since_door_entry == 3 and
-            hasattr(self.agent, 'detect_scene_type_from_vlm')):
-            self.agent.detect_scene_type_from_vlm(direction_image, self.current_episode['object'])
-            if hasattr(self.agent, 'check_scene_mismatch_and_block'):
-                self.agent.check_scene_mismatch_and_block(obs['agent_state'])
-
         #  转向目标方向
         for j in range(min(11 - goal_rotate, 1 + goal_rotate)):
             if goal_rotate <= 6:

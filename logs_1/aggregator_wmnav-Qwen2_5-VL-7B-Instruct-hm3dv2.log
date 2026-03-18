@@ -1,0 +1,13 @@
+WARNING: overwriting environment variables set in the machine
+overwriting variable ['LD_LIBRARY_PATH']
+wandb: Tracking run with wandb version 0.24.2
+wandb: W&B syncing is set to `offline` in this directory. Run `wandb online` or set WANDB_MODE=online to enable cloud syncing.
+wandb: Run data is saved locally in /data/vepfs/users/intern/ruijie.sang/Code/WMNavigation/wandb/offline-run-20260303_100120-bbhlo9wr
+Initialized WandB.
+ * Serving Flask app 'aggregator'
+ * Debug mode: off
+WARNING: This is a development server. Do not use it in a production deployment. Use a production WSGI server instead.
+ * Running on all addresses (0.0.0.0)
+ * Running on http://127.0.0.1:2000
+ * Running on http://10.240.2.106:2000
+Press CTRL+C to quit

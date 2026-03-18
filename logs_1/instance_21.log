@@ -1,0 +1,4 @@
+WARNING: overwriting environment variables set in the machine
+overwriting variable ['LD_LIBRARY_PATH']
+Platform::WindowlessEglApplication::tryCreateContext(): unable to find CUDA device 0 among 6 EGL devices in total
+WindowlessContext: Unable to create windowless context

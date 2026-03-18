@@ -1,3 +1,7 @@
+import os
+os.environ['MAGNUM_DEVICE_ID'] = '0'
+os.environ['EGL_DEVICE_ID'] = '0'
+
 import argparse
 import yaml
 
@@ -5,6 +9,8 @@ from dotenv import load_dotenv
 from api import *
 from WMNav_agent import *
 from WMNav_env import *
+from MerNav_agent import *
+from MerNav_env import *
 from custom_agent import *
 from custom_env import *
 
@@ -28,7 +34,6 @@ def main():
     parser.add_argument('--instance', type=int, help='Instance number for parallel execution (optional)')
     parser.add_argument('--port', type=int, help='port number for Flask server parallel execution (optional)')
     parser.add_argument('--dataset', type=str, default='hm3d_v0.2', choices=['hm3d_v0.1', 'hm3d_v0.2', 'mp3d'], help='Type of dataset')
-    parser.add_argument('--resume', action='store_true', default=False,help='Skip already completed episodes')
 
     args = parser.parse_args()
 
@@ -54,7 +59,6 @@ def main():
         config['env_cfg']['parallel'] = True
     if args.dataset:
         config['env_cfg']['dataset'] = args.dataset
-    config['env_cfg']['resume'] = args.resume
     env_cls = globals()[config['env_cls']]
     env = env_cls(cfg=config)
     env.run_experiment()

@@ -1,0 +1,17 @@
+{
+
+  "tv screen": [
+    "The TV is typically mounted on the wall. Please pay attention to the viewing angle relative to the wall, as well as the direction the sofa is directly facing."
+  ],
+  "sofa": [
+    "You are an object recognition assistant. A sofa is elongated with a pronounced length-to-width ratio, designed for multiple people, coming in straight, L-shaped, or U-shaped forms, with a backrest and armrests, upholstered in fabric or leather. Note: a sofa is different from an armchair (single-seat chair with armrests) — a sofa has multiple seats and is significantly larger and longer. Commonly found in living rooms, office reception areas, or cafés. Key features: high length-to-width ratio, multi-seat, has backrest and armrests, designed for sitting, used for leisure and socializing."],
+  "bed": [
+    "You are an object recognition assistant. A bed is rectangular with a moderate length-to-width ratio, appearing relatively square in proportion. It has a mattress, blankets, and pillows, usually with a headboard. Commonly found in bedrooms, hotel rooms, dormitories, or hospital wards. Key features: large surface, balanced proportions, designed for lying down, used for sleeping."
+  ],
+  "chair": [
+    "Please distinguish sofas from chairs by shape and size only. Do not misidentify a sofa as a chair. A sofa is wide for multiple people with a long backrest and armrests; a chair is small for single use with a compact structure."
+  ],
+  "toilet": [
+    "A toilet is a low, knee-high white ceramic fixture with an oval seat opening and a raised tank at the back, forming an L-shaped profile. It is almost exclusively found in bathrooms. If the current scene is not a bathroom, prioritize navigating to one before searching for a toilet. You must be 100% certain before identifying an object as a toilet — white doors, cabinets, and washing machines are tall, flat, vertical surfaces with no round opening or tank and should NEVER be mistaken for a toilet. Only confirm when you clearly see the oval bowl and tank structure."
+  ]
+}
