@@ -12,7 +12,7 @@ import json as _json
 from simWrapper import PolarAction
 from utils import *
 from api import *
-#带有记忆模块
+#最初版本
 class Agent:
     def __init__(self, cfg: dict):
         pass
@@ -742,7 +742,6 @@ class WMNavAgent(VLMNavAgent):
         self.recovery_8_dirs = []
         self._recovery_active = False
         self._consecutive_stop_calls = 0
-        self.experience_hints = [] 
 
         self.ActionVLM.reset()
         self.PlanVLM.reset()
@@ -1493,62 +1492,6 @@ class WMNavAgent(VLMNavAgent):
 
         return goal_flag, subtask
 
-    def load_experience(self, goal: str, experience_path: str = None):
-        """
-        从磁盘加载目标物的历史经验提示。
-        所有类别的经验存储在同一个 JSON 文件中，key 为目标物类别名。
-
-        Args:
-            goal: 目标物类别名，如 'chair', 'tv screen'
-            experience_path: JSON 文件路径，默认从环境变量 EXPERIENCE_PATH 读取，
-                            若未设置则使用 'experiences.json'
-        """
-        if experience_path is None:
-            experience_path = os.environ.get("EXPERIENCE_PATH", "experiences.json")
-
-        self.experience_hints = []
-
-        if not os.path.exists(experience_path):
-            logging.info(f"[Experience] 经验文件不存在: {experience_path}")
-            return
-
-        try:
-            with open(experience_path, 'r', encoding='utf-8') as f:
-                all_experiences = _json.load(f)
-        except Exception as e:
-            logging.warning(f"[Experience] 加载经验文件失败: {e}")
-            return
-
-        # 尝试多种 key 格式匹配：原始名、小写、空格转下划线
-        key = goal.strip().lower()
-        hints = all_experiences.get(key, None)
-        if hints is None:
-            key_alt = key.replace(" ", "_")
-            hints = all_experiences.get(key_alt, None)
-        if hints is None:
-            key_alt2 = key.replace("_", " ")
-            hints = all_experiences.get(key_alt2, None)
-
-        self.experience_hints = hints if isinstance(hints, list) else []
-        if self.experience_hints:
-            logging.info(f"[Experience] 为 '{goal}' 加载了 {len(self.experience_hints)} 条经验")
-        else:
-            logging.info(f"[Experience] 未找到 '{goal}' 的经验记录")
-
-    def _format_experience_prompt(self) -> str:
-        """
-        将已加载的经验提示格式化为可拼接到 prompt 末尾的文本段落。
-        如果没有经验，返回空字符串（不影响原有 prompt）。
-        """
-        if not self.experience_hints:
-            return ""
-        hints_text = "\n".join(f"- {h}" for h in self.experience_hints)
-        return (
-            "\n\n[EXPERIENCE FROM PREVIOUS EPISODES] "
-            "The following lessons were learned from past navigation attempts for this target. "
-            "You MUST follow these carefully to avoid repeating the same mistakes:\n"
-            f"{hints_text}\n"
-        )
 
     # ═══════════════════════════════════════════════════════════════════
     # 模块一: 语义记忆与先验引导
@@ -2074,7 +2017,7 @@ class WMNavAgent(VLMNavAgent):
             f'(3) If there is a way to move to another area, assign a score based on your estimate of the likelihood of finding a {goal}, using your common sense. Moving to another area means there is a turn in the corner, an open door, a hallway, etc. Note you CANNOT GO THROUGH CLOSED DOORS. CLOSED DOORS and GOING UP OR DOWN STAIRS are not considered. '
             "For each direction, provide an explanation for your assigned score. Format your answer in the json {'30': {'Score': <The score(from 0 to 10) of angle 30>, 'Explanation': <An explanation for your assigned score.>}, '90': {...}, '150': {...}, '210': {...}, '270': {...}, '330': {...}}. "
             "Answer Example: {'30': {'Score': 0, 'Explanation': 'Dead end with a recliner. No sign of a bed or any other room.'}, '90': {'Score': 2, 'Explanation': 'Dining area. It is possible there is a doorway leading to other rooms, but bedrooms are less likely to be directly adjacent to dining areas.'}, ..., '330': {'Score': 2, 'Explanation': 'Living room area with a recliner.  Similar to 270, there is a possibility of other rooms, but no strong indication of a bedroom.'}}")
-            return evaluator_prompt + self._format_experience_prompt()
+            return evaluator_prompt
         if prompt_type == 'planning':
             if reason != '' and subtask != '{}':
                 planning_prompt = (f"The agent has been tasked with navigating to a {goal.upper()}. The agent has sent you the following elements:"
@@ -2095,7 +2038,7 @@ class WMNavAgent(VLMNavAgent):
                 f'(2) If the {goal} is not found, describe where you are going next to be more likely to find clues to the the {goal} and analyze the room type and think about whether the {goal} is likely to occur in that direction. Note you need to pay special attention to open doors and hallways, as they can lead to other unseen rooms. Note GOING UP OR DOWN STAIRS is an option. '
                 "Format your answer in the json {{'Subtask': <Where you are going next>, 'Flag': <Whether the target is in your view, True or False>}}. "
                 "Answer Example: {{'Subtask': 'Go to the hallway', 'Flag': False}} or {{'Subtask': "+f"'Go to the {goal}'"+", 'Flag': True}} or {{'Subtask': 'Go to the open door', 'Flag': True}}")
-            return planning_prompt + self._format_experience_prompt()
+            return planning_prompt
         if prompt_type == 'action':
             if subtask != '{}':
                 action_prompt = (
@@ -2113,6 +2056,6 @@ class WMNavAgent(VLMNavAgent):
                     f"First, tell me what you see in your sensor observation, and if you have any leads on finding the {goal.upper()}. Second, tell me which general direction you should go in. "
                     "Lastly, explain which action acheives that best, and return it as {{'action': <action_key>}}. Note you CANNOT GO THROUGH CLOSED DOORS, and you DO NOT NEED TO GO UP OR DOWN STAIRS"
                 )
-            return action_prompt + self._format_experience_prompt()
+            return action_prompt
 
         raise ValueError('Prompt type must be goal, predicting, planning, or action')

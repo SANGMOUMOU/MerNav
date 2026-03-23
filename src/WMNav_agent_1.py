@@ -6,13 +6,11 @@ import numpy as np
 import cv2
 import ast
 import concurrent.futures
-from collections import deque
-import json as _json
 
 from simWrapper import PolarAction
 from utils import *
 from api import *
-
+#原始版本所用的agent代码，需要使用env_1文件和config中的WMNav_1.yaml配置文件才能运行，api_1文件
 class Agent:
     def __init__(self, cfg: dict):
         pass
@@ -721,28 +719,6 @@ class WMNavAgent(VLMNavAgent):
         self.step_ndx = 0
         self.init_pos = None
         self.turned = -self.cfg['turn_around_cooldown']
-
-        # ── 模块一: 语义先验 ──
-        self.target_scene_prior = ""
-        self.prior_likely_rooms = []
-        self.prior_unlikely_rooms = []
-        self._prior_injected = False
-
-        # ── 模块二: 工作记忆 & 局部拓扑 ──
-        self.door_memory = []
-        self.current_scene_type = "unknown"
-        self.steps_since_door_entry = 0
-        self._room_exhausted = False
-        self._room_mismatch_blocked = False
-
-        # ── 模块三: 空间记忆 & 鲁棒兜底 ──
-        self.known_target_coords = None
-        self.position_history = deque(maxlen=8)
-        self.stuck_counter = 0
-        self.recovery_8_dirs = []
-        self._recovery_active = False
-        self._consecutive_stop_calls = 0
-
         self.ActionVLM.reset()
         self.PlanVLM.reset()
         self.PredictVLM.reset()
@@ -773,7 +749,7 @@ class WMNavAgent(VLMNavAgent):
         radius = int(np.linalg.norm(np.array(agent_coords) - np.array(point)))
         cv2.circle(self.explored_map, agent_coords, radius, self.explored_color, -1)  # -1表示实心圆
 
-    def _stopping_module(self, obs, threshold_dist=1.5):
+    def _stopping_module(self, obs, threshold_dist=0.8):
         if self.goal_position:
             arr = np.array(self.goal_position)
             # 按列计算平均值
@@ -985,12 +961,12 @@ class WMNavAgent(VLMNavAgent):
         """Excutes the navigability, action_proposer and projection submodules."""
         agent_state = obs['agent_state']
         images = {'color_sensor': obs['color_sensor'].copy()}
-        
-        # GoalVLM 现在只需要干净的无箭头原图
         candidate_images = {'color_sensor': obs['color_sensor'].copy()}
+        a_goal_projected = None
 
         if self.cfg['navigability_mode'] == 'none':
             a_final = [
+                # Actions for the w/o nav baseline
                 (self.cfg['max_action_dist'], -0.36 * np.pi),
                 (self.cfg['max_action_dist'], -0.28 * np.pi),
                 (self.cfg['max_action_dist'], 0),
@@ -1000,13 +976,15 @@ class WMNavAgent(VLMNavAgent):
         else:
             a_initial = self._navigability(obs)
             a_final = self._action_proposer(a_initial, agent_state)
+            if obs['goal_flag']:
+                a_goal = self._goal_proposer(a_initial, agent_state)
 
-        # 仅将方向箭头绘制在给 ActionVLM 的图上
         a_final_projected = self._projection(a_final, images, agent_state, obs['goal'])
+        if obs['goal_flag']:
+            a_goal_projected = self._projection(a_goal, candidate_images, agent_state, obs['goal'], candidate_flag=True)
         images['voxel_map'] = self._generate_voxel(a_final_projected, agent_state=agent_state, step=self.step_ndx)
-        
-        # 注意：这里我们移除了 a_goal 的生成和投射
-        return a_final_projected, images, None, candidate_images
+        return a_final_projected, images, a_goal_projected, candidate_images
+
     def navigability(self, obs: dict, direction_idx: int):
         """Generates the set of navigability actions and updates the voxel map accordingly."""
         agent_state: habitat_sim.AgentState = obs['agent_state']
@@ -1126,57 +1104,33 @@ class WMNavAgent(VLMNavAgent):
 
         return step_metadata, logging_data, response
 
-    def _goal_module(self, goal_image: np.array, goal):
-        """Determines if the target is visible and returns its pixel coordinates."""
-        location_prompt = self._construct_prompt(goal, 'goal')
+    def _goal_module(self, goal_image: np.array, a_goal, goal):
+        """Determines if the agent should stop."""
+        location_prompt = self._construct_prompt(goal, 'goal', num_actions=len(a_goal))
         location_response = self.GoalVLM.call([goal_image], location_prompt)
         dct = self._eval_response(location_response)
 
-        visible = dct.get('Visible', False)
-        coords = dct.get('Coordinates', None)
-        reason = dct.get('Reason', '') # 解析新增的 Reason 字段
+        try:
+            number = int(dct['Number'])
+        except:
+            number = None
 
-        if visible and isinstance(coords, list) and len(coords) == 2:
-            try:
-                coords = [int(coords[0]), int(coords[1])]
-            except ValueError:
-                coords = None
-        else:
-            coords = None
-            # 只有在没找到目标时才打印原因
-            if reason:
-                logging.info(f"[GoalVLM] {goal} not visible. Reason: {reason}")
+        return number, location_response
 
-        return visible, coords, location_response
+    def _get_goal_position(self, action_goal, idx, agent_state):
+        for key, value in action_goal.items():
+            if value == idx:
+                r, theta = key
+                break
 
-    def _get_goal_position_from_pixels(self, px: int, py: int, agent_state: habitat_sim.AgentState, sensor_state: habitat_sim.SixDOFPose, depth_image: np.ndarray):
-        """Convert 2D pixel coordinates to 3D global position using depth."""
-        # 限制坐标在图像分辨率范围内
-        px = int(np.clip(px, 0, self.resolution[1] - 1))
-        py = int(np.clip(py, 0, self.resolution[0] - 1))
-
-        # 获取该像素点的深度值
-        depth_val = depth_image[py, px]
-
-        # 如果深度无效或太远（比如天空盒），可以做个安全检查
-        if depth_val <= 0 or depth_val > 50.0:
-            logging.warning(f"[_get_goal_position] Invalid depth {depth_val} at ({px}, {py})")
-            return None, None
-
-        # 反投影到相机坐标系
-        camera_coords = unproject_2d(px, py, depth_val, resolution=self.resolution, focal_length=self.focal_length)
-        
-        # 转换为Agent局部坐标系，再转为全局坐标系
-        local_coords = global_to_local(
-            agent_state.position, agent_state.rotation,
-            local_to_global(sensor_state.position, sensor_state.rotation, camera_coords)
-        )
-        global_goal = local_to_global(agent_state.position, agent_state.rotation, local_coords)
-
-        # 生成目标掩码（用于更新 Curiosity Value Map，和原来逻辑保持一致）
         agent_coords = self._global_to_grid(agent_state.position)
+
+        local_goal = np.array([r * np.sin(theta), 0, -r * np.cos(theta)])
+        global_goal = local_to_global(agent_state.position, agent_state.rotation, local_goal)
         point = self._global_to_grid(global_goal)
-        radius = 1  # 目标半径影响范围 (m)
+
+        # get top down radius
+        radius = 1  # real radius (m)
         local_radius = np.array([0, 0, -radius])
         global_radius = local_to_global(agent_state.position, agent_state.rotation, local_radius)
         radius_point = self._global_to_grid(global_radius)
@@ -1191,98 +1145,35 @@ class WMNavAgent(VLMNavAgent):
     def _choose_action(self, obs: dict):
         agent_state = obs['agent_state']
         goal = obs['goal']
-        plan_visible = obs['goal_flag']
 
-        a_final, images, step_metadata, _, candidate_images = self._run_threads(obs, [obs['color_sensor']], goal)
+        a_final, images, step_metadata, a_goal, candidate_images = self._run_threads(obs, [obs['color_sensor']], goal)
 
         goal_image = candidate_images['color_sensor'].copy()
-        images['goal_image'] = goal_image
-        
-        distance_to_goal = float('inf')
-        logging_data = {}
+        if a_goal is not None:
+            goal_number, location_response = self._goal_module(goal_image, a_goal, goal)
+            images['goal_image'] = goal_image
+            if goal_number is not None and goal_number != 0:
+                goal_position, self.goal_mask = self._get_goal_position(a_goal, goal_number, agent_state)  # get goal position and update goal mask
+                self.goal_position.append(goal_position)
+
         step_metadata['object'] = goal
 
-        # 1. 每次 PlanVLM 检测到目标都调用 GoalVLM（去掉 known_target_coords is None 拦截）
-        if plan_visible:
-            goal_visible, target_pixels, location_response = self._goal_module(goal_image, goal)
+        # If the model calls stop two times in a row, terminate the episode
+        if step_metadata['called_stopping']:
+            step_metadata['action_number'] = -1
+            agent_action = PolarAction.stop
+            logging_data = {}
+        else:
+            if a_goal is not None and goal_number is not None and goal_number != 0:
+                logging_data = {}
+                logging_data['ACTION_NUMBER'] = int(goal_number)
+                step_metadata['action_number'] = goal_number
+                a_final = a_goal
+            else:
+                step_metadata, logging_data, _ = self._prompting(goal, a_final, images, step_metadata, obs['subtask'])
+            agent_action = self._action_number_to_polar(step_metadata['action_number'], list(a_final))
+        if a_goal is not None:
             logging_data['LOCATOR_RESPONSE'] = location_response
-            
-            if goal_visible and target_pixels is not None:
-                px, py = target_pixels[0], target_pixels[1]
-                
-                cv2.circle(images['goal_image'], (px, py), radius=8, color=(0, 255, 0), thickness=-1)
-                cv2.circle(images['goal_image'], (px, py), radius=10, color=(255, 0, 0), thickness=2)
-                text_str = f"Target: {goal}"
-                cv2.putText(images['goal_image'], text_str, (px + 15, py - 10), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
-
-                depth_image = obs['depth_sensor']
-                if self.cfg['navigability_mode'] == 'depth_estimate':
-                    depth_image = self.depth_estimator.call(obs['color_sensor'])
-                    
-                sensor_state = agent_state.sensor_states['color_sensor']
-                goal_position, goal_mask = self._get_goal_position_from_pixels(
-                    px, py, agent_state, sensor_state, depth_image
-                )
-
-                if goal_position is not None:
-                    self.goal_mask = goal_mask
-                    self.goal_position.append(goal_position)
-                    self.anchor_target_position(goal_position)
-                    logging.info(f"[Goal Updated] Target position updated. Total observations: {len(self.goal_position)}")
-
-        # 2. 距离计算模块
-        if self.known_target_coords is not None:
-            current_pos_2d = np.array([agent_state.position[0], agent_state.position[2]])
-            goal_pos_2d = np.array([self.known_target_coords[0], self.known_target_coords[2]])
-            
-            distance_to_goal = np.linalg.norm(current_pos_2d - goal_pos_2d)
-            logging.info(f"[Termination Check] Target Locked. Dist: {distance_to_goal:.2f}m")
-            
-            dist_str = f"Dist to Target: {distance_to_goal:.2f}m"
-            cv2.putText(images['goal_image'], "GOAL LOCKED", (20, 40), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2, cv2.LINE_AA)
-            cv2.putText(images['goal_image'], dist_str, (20, 80), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 0, 0), 2, cv2.LINE_AA)
-
-        # 3. 停止判定
-        threshold_dist = self.cfg.get('success_threshold', 1.0)
-        
-        # 连续粗判计数
-        if step_metadata.get('called_stopping', False):
-            self._consecutive_stop_calls += 1
-            logging.info(f"[StopModule] Consecutive stop calls: {self._consecutive_stop_calls}")
-        else:
-            self._consecutive_stop_calls = 0
-
-        if self._consecutive_stop_calls >= 2:
-            # 连续2次粗判（距离<1.5m）都认为到了，强制停止
-            logging.info(
-                f"SUCCESS! Consecutive stop calls reached {self._consecutive_stop_calls}. "
-                f"Dist: {distance_to_goal:.2f}m. Force STOPPING."
-            )
-            step_metadata['action_number'] = -1
-            agent_action = PolarAction.stop
-            
-        elif self.known_target_coords is not None and distance_to_goal < threshold_dist:
-            # 精确距离达标，立刻停止
-            logging.info(
-                f"SUCCESS! Reached target coordinates. "
-                f"Dist: {distance_to_goal:.2f}m < {threshold_dist}m. STOPPING."
-            )
-            step_metadata['action_number'] = -1
-            agent_action = PolarAction.stop
-            
-        else:
-            # 继续选路
-            step_metadata, prompt_logging, action_response = self._prompting(
-                goal, a_final, images, step_metadata, obs['subtask']
-            )
-            logging_data.update(prompt_logging)
-            agent_action = self._action_number_to_polar(
-                step_metadata['action_number'], list(a_final)
-            )
-
         metadata = {
             'step_metadata': step_metadata,
             'logging_data': logging_data,
@@ -1324,7 +1215,6 @@ class WMNavAgent(VLMNavAgent):
         return dct
 
     def _predicting_module(self, evaluator_image, goal):
-        logging.info(f"[PredictVLM] Goal received: '{goal}'")
         """Determines if the agent should stop."""
         evaluator_prompt = self._construct_prompt(goal, 'predicting')
         evaluator_response = self.PredictVLM.call([evaluator_image], evaluator_prompt)
@@ -1355,20 +1245,7 @@ class WMNavAgent(VLMNavAgent):
         angles = (np.arange(len(pano_images))) * 30
         inference_image = self._concat_panoramic(pano_images, angles)
 
-        # ── 模块二/三 prompt override 注入 ──
-        _extra_predict_prompt = ""
-        if hasattr(self, '_room_exhausted') and self._room_exhausted:
-            _extra_predict_prompt += self.get_exhaustion_prompt_override()
-        if hasattr(self, 'stuck_counter'):
-            _stuck_level = self.detect_stuck()
-            if _stuck_level == 1:
-                _extra_predict_prompt += self.get_stuck_prompt_override(_stuck_level)
-        _orig_sys = getattr(self.PredictVLM, 'system_instruction', '') or ''
-        if _extra_predict_prompt:
-            self.PredictVLM.system_instruction = _orig_sys + _extra_predict_prompt
         response = self._predicting_module(inference_image, goal)
-        if _extra_predict_prompt:
-            self.PredictVLM.system_instruction = _orig_sys
 
         explorable_value = {}
         reason = {}
@@ -1383,10 +1260,8 @@ class WMNavAgent(VLMNavAgent):
         return inference_image, explorable_value, reason
 
     @staticmethod
-    def _merge_evalue(arr, num, alpha=0.4):
-        """加权平均，允许历史低分被新高分拉回"""
-        # 原来：return np.minimum(arr, num)  # 只降不升
-        return arr * (1 - alpha) + num * alpha
+    def _merge_evalue(arr, num):
+        return np.minimum(arr, num)
 
     def update_curiosity_value(self, explorable_value, reason):
         try:
@@ -1404,49 +1279,22 @@ class WMNavAgent(VLMNavAgent):
 
                 mask_minus_intersection = self.effective_mask[angle] & ~intersection1 & ~intersection2
 
-                self.cvalue_map[mask_minus_intersection] = self._merge_evalue(
-                    self.cvalue_map[mask_minus_intersection], explorable_value[angle]
-                )
+                self.cvalue_map[mask_minus_intersection] = self._merge_evalue(self.cvalue_map[mask_minus_intersection], explorable_value[angle]) # update explorable value map
                 if np.all(intersection2 == False):
                     continue
-                self.cvalue_map[intersection2] = self._merge_evalue(
-                    self.cvalue_map[intersection2],
-                    (explorable_value[angle] + explorable_value[next_angle]) / 2
-                )
-
+                self.cvalue_map[intersection2] = self._merge_evalue(self.cvalue_map[intersection2], (explorable_value[angle] + explorable_value[next_angle]) / 2)  # update explorable value map
             if self.goal_mask is not None:
                 self.cvalue_map[self.goal_mask] = 10.0
-
-            # ===== 改进：融合当前VLM分数和历史地图分数 =====
-            current_weight = 0.4  # 当前VLM分数权重
-            history_weight = 0.6  # 历史地图分数权重
-
             for i in range(12):
                 if i % 2 == 0:
                     continue
                 angle = str(int(i * 30))
-                current_score = explorable_value[angle]
-
                 if np.all(self.panoramic_mask[angle] == False):
-                    final_score[i] = current_score
+                    final_score[i] = explorable_value[angle]
                 else:
-                    history_score = np.mean(self.cvalue_map[self.panoramic_mask[angle]])
-                    final_score[i] = current_weight * current_score + history_weight * history_score
-
-            # ===== 新增调试日志 =====
-            logging.info(f"[CuriosityValue] Raw VLM scores: {explorable_value}")
-            logging.info(f"[CuriosityValue] Final scores: { {k: round(v, 2) for k, v in final_score.items()} }")
-
-            # ── 模块三: 全局 recovery 方向强制 ──
-            if hasattr(self, '_recovery_active') and self._recovery_active and self.recovery_8_dirs:
-                _rec_dir = self.get_recovery_direction()
-                if _rec_dir is not None:
-                    _rec_idx = int(round(_rec_dir / 30)) % 12
-                    if _rec_idx in final_score:
-                        final_score[_rec_idx] = 100.0
+                    final_score[i] = np.mean(self.cvalue_map[self.panoramic_mask[angle]])
 
             idx = max(final_score, key=final_score.get)
-            logging.info(f"[CuriosityValue] Chosen: {idx} ({idx*30}deg), score={final_score[idx]:.2f}")
             final_reason = reason[str(int(idx * 30))]
         except:
             idx = np.random.randint(0, 12)
@@ -1492,528 +1340,22 @@ class WMNavAgent(VLMNavAgent):
 
         return goal_flag, subtask
 
-
-    # ═══════════════════════════════════════════════════════════════════
-    # 模块一: 语义记忆与先验引导
-    # ═══════════════════════════════════════════════════════════════════
-
-    def _vlm_text_only(self, vlm, prompt: str) -> str:
-        """
-        统一的纯文本 VLM 调用入口。
-        优先使用 call_text_only()，若不存在则用占位图调用 call()。
-        """
-        if hasattr(vlm, 'call_text_only'):
-            return vlm.call_text_only(prompt)
-        else:
-            _placeholder = np.zeros((64, 64, 3), dtype=np.uint8)
-            return vlm.call([_placeholder], prompt)
-
-    def acquire_semantic_prior(self, goal: str):
-        """
-        任务初始化时调用 LLM 获取目标的预期场景列表。
-        仅用于模块二的场景匹配判断，不注入 PredictVLM（VLM 看图时已有常识）。
-        prompt 要求简短回复（每列表最多5项），避免被 max_tokens 截断。
-        """
-        prior_prompt = (
-            f"A robot must find a \"{goal}\" in a home. "
-            f"Return JSON: "
-            f'{{\"likely_rooms\": [up to 5 room types where {goal} is usually found], '
-            f'\"unlikely_rooms\": [up to 5 room types where {goal} is rarely found]}}. '
-            f"Keep it SHORT. No markdown, no explanation, ONLY the JSON object."
-        )
-        try:
-            raw_response = self._vlm_text_only(self.PlanVLM, prior_prompt)
-            self.target_scene_prior = raw_response.strip()
-            self._parse_prior_json(raw_response)
-        except Exception as e:
-            logging.warning(f"[SemanticPrior] Failed to acquire prior: {e}")
-            self.target_scene_prior = ""
-            self.prior_likely_rooms = []
-            self.prior_unlikely_rooms = []
-
-        if self.prior_likely_rooms or self.prior_unlikely_rooms:
-            logging.info(f"[SemanticPrior] Likely: {self.prior_likely_rooms}")
-            logging.info(f"[SemanticPrior] Unlikely: {self.prior_unlikely_rooms}")
-        else:
-            logging.warning(f"[SemanticPrior] No prior acquired for \'{goal}\'")
-
-    def _parse_prior_json(self, raw_response: str):
-        """
-        从 LLM 响应中提取 likely_rooms / unlikely_rooms。
-        鲁棒处理：markdown fence、被截断的 JSON、单引号、多余文本。
-        """
-        import re as _re
-        text = raw_response.strip()
-
-        # 1) 去除 markdown code fence
-        text = _re.sub(r'^```(?:json)?\s*', '', text)
-        text = _re.sub(r'\s*```$', '', text)
-        text = text.strip()
-
-        # 2) 提取 JSON 块
-        brace_start = text.find('{')
-        if brace_start == -1:
-            logging.warning(f"[SemanticPrior] No JSON found in: {raw_response[:150]}")
-            self.prior_likely_rooms = []
-            self.prior_unlikely_rooms = []
-            return
-
-        # 寻找匹配的闭合大括号
-        depth = 0
-        brace_end = -1
-        for i in range(brace_start, len(text)):
-            if text[i] == '{':
-                depth += 1
-            elif text[i] == '}':
-                depth -= 1
-                if depth == 0:
-                    brace_end = i
-                    break
-
-        if brace_end != -1:
-            # 正常闭合
-            text = text[brace_start:brace_end + 1]
-        else:
-            # JSON 被截断（没有闭合括号）→ 尝试修复
-            text = text[brace_start:]
-            logging.warning(f"[SemanticPrior] JSON truncated, attempting repair...")
-            # 去掉最后一个不完整的元素（截断处通常在引号中间）
-            # 策略：找最后一个完整的引号字符串后截断
-            last_good = max(text.rfind('",'), text.rfind("',"))
-            if last_good > 0:
-                text = text[:last_good + 1]
-            # 补齐未闭合的括号
-            open_sq = text.count('[') - text.count(']')
-            open_br = text.count('{') - text.count('}')
-            text += ']' * max(open_sq, 0) + '}' * max(open_br, 0)
-
-        # 3) 多轮尝试解析
-        data = None
-        # 尝试1: 直接 json.loads
-        try:
-            data = _json.loads(text)
-        except:
-            pass
-        # 尝试2: 单引号转双引号
-        if data is None:
-            try:
-                data = _json.loads(text.replace("'", '"'))
-            except:
-                pass
-        # 尝试3: ast.literal_eval
-        if data is None:
-            try:
-                data = ast.literal_eval(text)
-            except:
-                pass
-
-        if data is None:
-            logging.warning(f"[SemanticPrior] Cannot parse prior JSON: {raw_response[:200]}")
-            self.prior_likely_rooms = []
-            self.prior_unlikely_rooms = []
-            return
-
-        if isinstance(data, dict):
-            self.prior_likely_rooms = list(set(
-                str(r).strip().lower() for r in data.get('likely_rooms', []) if str(r).strip()
-            ))
-            self.prior_unlikely_rooms = list(set(
-                str(r).strip().lower() for r in data.get('unlikely_rooms', []) if str(r).strip()
-            ))
-        else:
-            self.prior_likely_rooms = []
-            self.prior_unlikely_rooms = []
-
-    # ═══════════════════════════════════════════════════════════════════
-    # 模块二: 工作记忆与局部拓扑
-    # ═══════════════════════════════════════════════════════════════════
-
-    def _compute_local_cvalue_stats(self, agent_state):
-        agent_coords = self._global_to_grid(agent_state.position)
-        radius_px = int(2.5 * self.scale)
-        x, y = agent_coords
-        h, w = self.cvalue_map.shape[:2]
-        y1, y2 = max(0, y - radius_px), min(h, y + radius_px)
-        x1, x2 = max(0, x - radius_px), min(w, x + radius_px)
-
-        region_cvalue = self.cvalue_map[y1:y2, x1:x2]
-        vals = region_cvalue[:, :, 0].astype(np.float32)
-        explored_mask = vals < 9.9
-        if explored_mask.sum() == 0:
-            return 10.0, 0.0
-        mean_cvalue = float(np.mean(vals[explored_mask]))
-
-        region_explored = self.explored_map[y1:y2, x1:x2]
-        explored_pixels = np.all(region_explored == self.explored_color, axis=-1).sum()
-        total_pixels = max((y2 - y1) * (x2 - x1), 1)
-        coverage = explored_pixels / total_pixels
-        return mean_cvalue, coverage
-
-    def check_room_exhaustion(self, agent_state):
-        mean_cv, coverage = self._compute_local_cvalue_stats(agent_state)
-        self._room_exhausted = (mean_cv < 3.0 and coverage > 0.6)
-        if self._room_exhausted:
-            logging.info(f"[WorkingMemory] Room exhausted: mean_cvalue={mean_cv:.2f}, coverage={coverage:.2f}")
-        return self._room_exhausted
-
-    def get_exhaustion_prompt_override(self):
-        if not self._room_exhausted:
-            return ""
-        return (
-            "\n[OVERRIDE] The current room/area has been thoroughly searched and "
-            "the target was NOT found here. You MUST prioritize directions that lead "
-            "OUT of this room — look for doors, hallways, corridors, or openings to "
-            "other areas. Assign score >= 8 to any exit direction and score 0 to "
-            "directions deeper into this already-explored room."
-        )
-
-    def detect_scene_type_from_vlm(self, image, goal):
-        scene_prompt = (
-            f"Look at this image of an indoor environment. "
-            f"What type of room or area is this? "
-            f"Reply with ONLY a short room type label (e.g., bedroom, kitchen, bathroom, "
-            f"living room, hallway, closet, garage, office, laundry room, pantry, mudroom, "
-            f"sunroom, guest room, workshop, utility room, dining room, etc.). "
-            f"If uncertain, reply with your best guess. ONE label only, no extra text."
-        )
-        try:
-            resp = self.PlanVLM.call([image], scene_prompt)
-            self.current_scene_type = resp.strip().lower()
-            logging.info(f"[WorkingMemory] Detected scene type: {self.current_scene_type}")
-        except Exception as e:
-            logging.warning(f"[WorkingMemory] Scene detection failed: {e}")
-            self.current_scene_type = "unknown"
-
-    def _is_scene_mismatch(self):
-        if self.current_scene_type == "unknown":
-            return False
-        scene = self.current_scene_type
-
-        if self.prior_likely_rooms or self.prior_unlikely_rooms:
-            for likely in self.prior_likely_rooms:
-                if self._semantic_room_match(scene, likely):
-                    logging.info(f"[Mismatch L1] '{scene}' matches likely '{likely}' -> OK")
-                    return False
-            for unlikely in self.prior_unlikely_rooms:
-                if self._semantic_room_match(scene, unlikely):
-                    logging.info(f"[Mismatch L1] '{scene}' matches unlikely '{unlikely}' -> MISMATCH")
-                    return True
-
-        return self._llm_judge_scene_match(scene)
-
-    @staticmethod
-    def _semantic_room_match(scene_type: str, room_label: str) -> bool:
-        s = scene_type.lower().strip()
-        r = room_label.lower().strip()
-        if s in r or r in s:
-            return True
-
-        _synonym_groups = [
-            {"living room", "lounge", "family room", "sitting room", "front room", "den"},
-            {"bathroom", "washroom", "restroom", "toilet", "powder room", "lavatory", "bath"},
-            {"bedroom", "master bedroom", "guest room", "guest bedroom", "sleeping room"},
-            {"kitchen", "kitchenette"},
-            {"dining room", "dining area", "breakfast room", "breakfast nook", "dinette"},
-            {"hallway", "corridor", "hall", "passage", "passageway", "entryway", "foyer", "vestibule", "lobby"},
-            {"closet", "wardrobe", "storage room", "walk-in closet", "linen closet", "storage closet"},
-            {"garage", "carport", "car garage"},
-            {"office", "study", "home office", "workroom", "workspace"},
-            {"laundry", "laundry room", "utility room", "mudroom", "mud room"},
-            {"basement", "cellar"},
-            {"attic", "loft", "attic space"},
-            {"nursery", "baby room", "children's room", "kids room", "playroom", "kid's room"},
-            {"patio", "terrace", "deck", "veranda", "porch", "lanai"},
-            {"balcony", "terrace", "juliet balcony"},
-            {"pantry", "larder", "food storage", "butler's pantry"},
-            {"sunroom", "conservatory", "solarium", "sun porch", "sun room"},
-            {"workshop", "workbench area", "tool room", "tool shed"},
-            {"rec room", "recreation room", "game room", "bonus room", "man cave", "media room"},
-        ]
-        for group in _synonym_groups:
-            s_in = any(s in name or name in s for name in group)
-            r_in = any(r in name or name in r for name in group)
-            if s_in and r_in:
-                return True
-        return False
-
-    def _llm_judge_scene_match(self, scene_type: str) -> bool:
-        context_parts = []
-        if self.target_scene_prior:
-            context_parts.append(f"Background knowledge: {self.target_scene_prior}")
-        if self.prior_likely_rooms:
-            context_parts.append(f"Likely rooms: {', '.join(self.prior_likely_rooms)}")
-        if self.prior_unlikely_rooms:
-            context_parts.append(f"Unlikely rooms: {', '.join(self.prior_unlikely_rooms)}")
-        if not context_parts:
-            return False
-
-        context = "\n".join(context_parts)
-        judge_prompt = (
-            f"A robot is searching for a specific target object inside a home.\n"
-            f"{context}\n"
-            f"The robot just entered a room identified as: \"{scene_type}\".\n"
-            f"Is it VERY UNLIKELY that the target object would be found in a \"{scene_type}\"?\n"
-            f"Answer ONLY \"yes\" or \"no\":\n"
-            f"  yes = very unlikely here, robot should leave\n"
-            f"  no  = might be here, or not sure"
-        )
-        try:
-            resp = self._vlm_text_only(self.PlanVLM, judge_prompt).strip().lower()
-            is_mismatch = resp.startswith("yes") or ("yes" in resp and "no" not in resp)
-            logging.info(f"[Mismatch L2] LLM judge: scene='{scene_type}', mismatch={is_mismatch}, raw='{resp[:80]}'")
-            return is_mismatch
-        except Exception as e:
-            logging.warning(f"[Mismatch L2] LLM judge failed: {e}")
-            return False
-
-    def check_scene_mismatch_and_block(self, agent_state):
-        """
-        场景不匹配处理（重构版）：
-        不直接封杀当前区域，而是：
-        1. 降低当前已探索区域的 cvalue（降权但不清零，仍允许路过）
-        2. 提高所有未探索方向的 cvalue（引导去找预期场景）
-        3. 如果有门记忆，优先引导回到门的方向（去其他房间找预期场景）
-        """
-        if self.steps_since_door_entry < 3:
-            return False
-        if not self._is_scene_mismatch():
-            return False
-
-        logging.info(
-            f"[WorkingMemory] Scene MISMATCH: current='{self.current_scene_type}', "
-            f"expected={self.prior_likely_rooms}. Prioritizing unexplored areas."
-        )
-        self._room_mismatch_blocked = True
-
-        # 1) 降低当前区域 cvalue（降权，不是清零）
-        agent_coords = self._global_to_grid(agent_state.position)
-        radius_px = int(2.0 * self.scale)
-        x, y = agent_coords
-        h, w = self.cvalue_map.shape[:2]
-        y1, y2 = max(0, y - radius_px), min(h, y + radius_px)
-        x1, x2 = max(0, x - radius_px), min(w, x + radius_px)
-        # 将已探索的当前区域 cvalue 减半（最低到 1.0），而非直接置 0.1
-        region = self.cvalue_map[y1:y2, x1:x2].astype(np.float32)
-        region = np.maximum(region * 0.5, 1.0)
-        self.cvalue_map[y1:y2, x1:x2] = region.astype(np.float16)
-
-        # 2) 提高未探索方向的 cvalue（引导 agent 离开去寻找预期场景）
-        for angle_key, mask in self.panoramic_mask.items():
-            if not np.any(mask):
-                continue
-            # 检查该方向的 explored_map 覆盖率
-            direction_explored = self.explored_map[mask]
-            explored_count = np.all(direction_explored == self.explored_color, axis=-1).sum()
-            total_count = max(mask.sum(), 1)
-            explore_ratio = explored_count / total_count
-            # 未充分探索的方向 → 提高 cvalue
-            if explore_ratio < 0.4:
-                current_vals = self.cvalue_map[mask].astype(np.float32)
-                boosted = np.minimum(current_vals + 3.0, 10.0)
-                self.cvalue_map[mask] = boosted.astype(np.float16)
-                logging.info(
-                    f"[WorkingMemory] Boosted unexplored direction {angle_key}deg "
-                    f"(explore_ratio={explore_ratio:.2f})"
-                )
-
-        # 3) 如果有门记忆，强力引导回到最近的门方向（去其他房间）
-        if self.door_memory:
-            last_door = self.door_memory[-1]
-            door_grid = self._global_to_grid(
-                np.array([last_door[0], agent_state.position[1], last_door[1]])
-            )
-            dr = int(1.5 * self.scale)
-            dy1, dy2 = max(0, door_grid[1] - dr), min(h, door_grid[1] + dr)
-            dx1, dx2 = max(0, door_grid[0] - dr), min(w, door_grid[0] + dr)
-            self.cvalue_map[dy1:dy2, dx1:dx2] = 10.0
-            logging.info("[WorkingMemory] Door direction boosted to 10.0")
-
-        return True
-
-    def record_door_position(self, agent_state):
-        pos = agent_state.position
-        self.door_memory.append((float(pos[0]), float(pos[2])))
-        self.steps_since_door_entry = 0
-        self._room_mismatch_blocked = False
-        logging.info(f"[WorkingMemory] Door recorded at ({pos[0]:.2f}, {pos[2]:.2f})")
-
-    # ═══════════════════════════════════════════════════════════════════
-    # 模块三: 空间记忆与鲁棒兜底
-    # ═══════════════════════════════════════════════════════════════════
-
-    def anchor_target_position(self, global_goal_position):
-        self.known_target_coords = np.array(global_goal_position, dtype=np.float64)
-        logging.info(f"[SpatialMemory] Target anchored at {self.known_target_coords}")
-
-    def apply_target_anchor_bias(self, agent_state):
-        """
-        障碍物感知的目标锚定偏置：
-        
-        原方法：直接给目标正方向 cvalue=10，不管该方向是否有墙
-        新方法：从目标方向开始，向两侧扫描可通行方向，给最优方向加分
-        
-        搜索逻辑：
-        目标正方向 → 左偏30° → 右偏30° → 左偏60° → 右偏60° → ...
-        评分逻辑：
-        偏移0° → 10分, 偏移30° → 8分, 偏移60° → 6分, 偏移90° → 4分
-        """
-        if self.known_target_coords is None:
-            return
-        
-        dx = self.known_target_coords[0] - agent_state.position[0]
-        dz = self.known_target_coords[2] - agent_state.position[2]
-        dist = np.sqrt(dx * dx + dz * dz)
-        if dist < 0.3:
-            return
-
-        # 计算目标相对于 agent 前方的角度
-        target_angle_world = np.arctan2(dx, -dz)
-        forward = habitat_sim.utils.quat_rotate_vector(agent_state.rotation, habitat_sim.geo.FRONT)
-        agent_angle_world = np.arctan2(forward[0], -forward[2])
-        relative_yaw = target_angle_world - agent_angle_world
-        relative_yaw = (relative_yaw + np.pi) % (2 * np.pi) - np.pi
-
-        # 映射到最近的30°方向索引 (0~11)
-        target_dir_idx = int(round(np.degrees(relative_yaw) / 30)) % 12
-        target_angle_key = str(target_dir_idx * 30)
-
-        # 从目标方向开始，向两侧搜索可通行方向
-        # 最大搜索范围 ±90°（3格）
-        search_offsets = [0, 1, -1, 2, -2, 3, -3]
-        
-        chosen_key = None
-        chosen_score = 0.0
-
-        for offset in search_offsets:
-            check_idx = (target_dir_idx + offset) % 12
-            angle_key = str(check_idx * 30)
-
-            # 检查该方向是否存在可通行区域
-            if angle_key not in self.panoramic_mask:
-                continue
-            if not np.any(self.panoramic_mask[angle_key]):
-                continue
-            
-            # 进一步检查：该方向是否有有效通行距离（effective_mask）
-            has_effective_path = (
-                angle_key in self.effective_mask 
-                and np.any(self.effective_mask[angle_key])
-            )
-            
-            if has_effective_path:
-                # 偏离目标方向越少，分数越高
-                chosen_score = max(10.0 - abs(offset) * 2.0, 4.0)
-                chosen_key = angle_key
-                break
-        
-        # 如果 effective_mask 都不通，退而求其次用 panoramic_mask
-        if chosen_key is None:
-            for offset in search_offsets:
-                check_idx = (target_dir_idx + offset) % 12
-                angle_key = str(check_idx * 30)
-                if angle_key in self.panoramic_mask and np.any(self.panoramic_mask[angle_key]):
-                    chosen_score = max(10.0 - abs(offset) * 2.0, 4.0)
-                    chosen_key = angle_key
-                    break
-
-        # 应用偏置
-        if chosen_key is not None:
-            mask = self.panoramic_mask[chosen_key]
-            self.cvalue_map[mask] = np.maximum(
-                self.cvalue_map[mask], chosen_score
-            )
-            
-            if chosen_key != target_angle_key:
-                logging.info(
-                    f"[SpatialMemory] Target dir {target_angle_key}° BLOCKED, "
-                    f"rerouted to {chosen_key}° (score={chosen_score:.1f}, dist={dist:.2f}m)"
-                )
-            else:
-                logging.info(
-                    f"[SpatialMemory] Target anchor bias -> {chosen_key}° "
-                    f"(score={chosen_score:.1f}, dist={dist:.2f}m)"
-                )
-        else:
-            logging.warning(
-                f"[SpatialMemory] No navigable direction found near target "
-                f"(target_dir={target_angle_key}°, dist={dist:.2f}m)"
-            )
-
-    def update_position_history(self, agent_state):
-        pos = np.array([agent_state.position[0], agent_state.position[2]])
-        self.position_history.append(pos)
-
-    def detect_stuck(self, threshold=0.15, window=3):
-        if len(self.position_history) < window + 1:
-            return 0
-        positions = list(self.position_history)
-        displacements = [np.linalg.norm(positions[i] - positions[i - 1]) for i in range(-window, 0)]
-
-        if all(d < threshold for d in displacements):
-            self.stuck_counter += 1
-        else:
-            self.stuck_counter = 0
-            self._recovery_active = False
-            self.recovery_8_dirs = []
-            return 0
-
-        if self.stuck_counter >= 6:
-            return 2
-        elif self.stuck_counter >= 1:
-            return 1
-        return 0
-
-    def get_stuck_prompt_override(self, stuck_level):
-        if stuck_level == 1:
-            return (
-                "\n[STUCK OVERRIDE] The robot appears stuck. It has barely moved for several steps. "
-                "Prioritize the direction with the LARGEST open/connected area. "
-                "Assign score >= 9 to the most open direction and 0 to blocked directions."
-            )
-        return ""
-
-    def init_global_recovery(self):
-        if not self._recovery_active:
-            self._recovery_active = True
-            self.recovery_8_dirs = list(range(0, 360, 45))
-            logging.info("[Recovery] Global recovery initiated: 8-direction sweep")
-
-    def get_recovery_direction(self):
-        if self.recovery_8_dirs:
-            return self.recovery_8_dirs.pop(0)
-        return None
-
-    def apply_recovery_direction_to_cvalue(self, agent_state, direction_deg):
-        dir_idx = int(round(direction_deg / 30)) % 12
-        angle_key = str(dir_idx * 30)
-        if angle_key in self.panoramic_mask:
-            mask = self.panoramic_mask[angle_key]
-            if np.any(mask):
-                self.cvalue_map[mask] = 10.0
-                logging.info(f"[Recovery] Forced {direction_deg}deg -> {angle_key}deg cvalue=10")
-                return True
-        return False
-
     def _construct_prompt(self, goal: str, prompt_type:str, subtask: str='{}', reason: str='{}', num_actions: int=0):
         if prompt_type == 'goal':
-            location_prompt = (
-                f"The agent has been tasked with navigating to a {goal.upper()}. The agent has sent you an image taken from its current location. "
-                f"First, tell me whether the {goal} is in the image, and make sure the object you see is ACTUALLY a {goal}. "
-                f"Second, if there is a {goal} in the image, provide the 2D pixel coordinates [x, y] of the center of the {goal} in the image. "
-                f"Assume the image width is {self.resolution[1]} and height is {self.resolution[0]}. (x is the horizontal axis from 0 to {self.resolution[1]}, y is the vertical axis from 0 to {self.resolution[0]}). "
-                f"If you are certain the {goal} is NOT visible in the image at all, set 'Visible' to False and provide a short, clear reason why (e.g., 'The image only shows a blank wall', 'This is a kitchen with no bed'). "
-                "Format your answer as a JSON dict strictly like this: {'Visible': True, 'Coordinates': [x, y], 'Reason': ''} or {'Visible': False, 'Coordinates': [], 'Reason': '<short explanation>'}."
-            )
+            location_prompt = (f"The agent has been tasked with navigating to a {goal.upper()}. The agent has sent you an image taken from its current location. "
+            f"There are {num_actions} red arrows superimposed onto your observation, which represent potential positions. " 
+            f"These are labeled with a number in a white circle, which represent the location you can move to. "
+            f"First, tell me whether the {goal} is in the image, and make sure the object you see is ACTUALLY a {goal}, return number 0 if if there is no {goal}, or if you are not sure. Note a chair must have a backrest and a chair is not a stool. Note a chair is NOT sofa(couch) which is NOT a bed. "
+            f'Second, if there is {goal} in the image, then determine which circle best represents the location of the {goal}(close enough to the target. If a person is standing in that position, they can easily touch the {goal}), and give the number and a reason. '
+            f'If none of the circles represent the position of the {goal}, return number 0, and give a reason why you returned 0. '
+            "Format your answer in the json {{'Number': <The number you choose>}}")
             return location_prompt
         if prompt_type == 'predicting':
             evaluator_prompt = (f"The agent has been tasked with navigating to a {goal.upper()}. The agent has sent you the panoramic image describing your surrounding environment, each image contains a label indicating the relative rotation angle(30, 90, 150, 210, 270, 330) with red fonts. "
             f'Your job is to assign a score to each direction (ranging from 0 to 10), judging whether this direction is worth exploring. The following criteria should be used: '
             f'To help you describe the layout of your surrounding,  please follow my step-by-step instructions: '
             f'(1) If there is no visible way to move to other areas and it is clear that the target is not in sight, assign a score of 0. Note a chair must have a backrest and a chair is not a stool. Note a chair is NOT sofa(couch) which is NOT a bed. '
-            f'(2) If you can ACTUALLY SEE a {goal} in the image for that direction (not just guessing it might exist nearby), assign a score of 10. '
-            f'CRITICAL: If your explanation describes a {goal} as physically visible in that direction (e.g., "there is a chair", "a chair is visible", "with a chair"), you MUST give a score of 10. '
-            f'It is WRONG to describe seeing a {goal} but give a score less than 10. '
-            f'However, do NOT give 10 for mere speculation like "a chair might be in the adjacent room" — that is just a guess, not actual detection. '
+            f'(2) If the {goal} is found, assign a score of 10.  ' 
             f'(3) If there is a way to move to another area, assign a score based on your estimate of the likelihood of finding a {goal}, using your common sense. Moving to another area means there is a turn in the corner, an open door, a hallway, etc. Note you CANNOT GO THROUGH CLOSED DOORS. CLOSED DOORS and GOING UP OR DOWN STAIRS are not considered. '
             "For each direction, provide an explanation for your assigned score. Format your answer in the json {'30': {'Score': <The score(from 0 to 10) of angle 30>, 'Explanation': <An explanation for your assigned score.>}, '90': {...}, '150': {...}, '210': {...}, '270': {...}, '330': {...}}. "
             "Answer Example: {'30': {'Score': 0, 'Explanation': 'Dead end with a recliner. No sign of a bed or any other room.'}, '90': {'Score': 2, 'Explanation': 'Dining area. It is possible there is a doorway leading to other rooms, but bedrooms are less likely to be directly adjacent to dining areas.'}, ..., '330': {'Score': 2, 'Explanation': 'Living room area with a recliner.  Similar to 270, there is a possibility of other rooms, but no strong indication of a bedroom.'}}")

@@ -16,7 +16,7 @@ from simWrapper import PolarAction, SimWrapper
 from WMNav_agent import *
 from custom_agent import *
 from utils import *
-#最初版本
+#版本三，在版本二的基础上增加了加载记忆的功能
 class Env:
     """
     Base class for creating an environment for embodied navigation tasks.
@@ -400,6 +400,11 @@ class WMNavEnv(Env):
         # ── 模块一: 任务初始化时获取语义先验 ──
         if hasattr(self.agent, 'acquire_semantic_prior'):
             self.agent.acquire_semantic_prior(self.current_episode['object'])  # Initialize the last subtask with an empty dictionary
+        # ── 经验知识库: 从磁盘加载目标物的历史经验 ──
+        if hasattr(self.agent, 'load_experience'):
+            self.agent.load_experience(self.current_episode['object'])
+
+        
         return obs
 
     def _step_env(self, obs: dict):

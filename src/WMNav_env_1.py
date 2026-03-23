@@ -16,7 +16,7 @@ from simWrapper import PolarAction, SimWrapper
 from WMNav_agent import *
 from custom_agent import *
 from utils import *
-
+#版本一：初始版本
 class Env:
     """
     Base class for creating an environment for embodied navigation tasks.

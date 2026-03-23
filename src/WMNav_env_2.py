@@ -16,7 +16,7 @@ from simWrapper import PolarAction, SimWrapper
 from WMNav_agent import *
 from custom_agent import *
 from utils import *
-#最初版本
+#版本二，在版本一的基础上增加了断点续跑；按场景筛选；从指定 episode 开始。
 class Env:
     """
     Base class for creating an environment for embodied navigation tasks.

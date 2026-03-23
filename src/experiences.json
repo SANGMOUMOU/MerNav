@@ -13,5 +13,8 @@
   ],
   "toilet": [
     "A toilet is a low, knee-high white ceramic fixture with an oval seat opening and a raised tank at the back, forming an L-shaped profile. It is almost exclusively found in bathrooms. If the current scene is not a bathroom, prioritize navigating to one before searching for a toilet. You must be 100% certain before identifying an object as a toilet — white doors, cabinets, and washing machines are tall, flat, vertical surfaces with no round opening or tank and should NEVER be mistaken for a toilet. Only confirm when you clearly see the oval bowl and tank structure."
+  ],
+  "plant": [
+    "Do not mistake artificial decorative flowers for a plant, and don’t refer to the greenery outside the window as a plant either."
   ]
 }

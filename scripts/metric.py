@@ -4,8 +4,8 @@ import numpy as np
 from pathlib import Path
 from collections import Counter
 
-base_dir = Path("/data/nas/users/ruijie.sang/logs/wmnav_qwen_train1/ObjectNav_wmnav-Qwen2_5-VL-7B-Instruct-hm3dv2")
-save_dir = Path("/data/nas/users/ruijie.sang/logs") # 保存在当前运行目录下
+base_dir = Path("/data/nas/users/ruijie.sang/logs/wmnav_qwen_train2/ObjectNav_wmnav-Qwen3-VL-8B-Instruct-hm3dv2")
+save_dir = Path("/data/nas/users/ruijie.sang/Metric") # 保存在当前运行目录下
 
 results = []
 

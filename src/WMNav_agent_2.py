@@ -12,7 +12,7 @@ import json as _json
 from simWrapper import PolarAction
 from utils import *
 from api import *
-#带有记忆模块并把相关困死状态修改了
+#版本二所用的agent代码，需要使用env_2文件和config中的WMNav_2.yaml配置文件才能运行，api_2文件
 class Agent:
     def __init__(self, cfg: dict):
         pass
@@ -249,20 +249,9 @@ class VLMNavAgent(Agent):
         topdown_map = self.voxel_map.copy()
         mask = np.all(self.explored_map == self.explored_color, axis=-1)
         topdown_map[mask] = self.explored_color
-        sorted_thetas = sorted(unique.keys())
-        theta_to_min_mag = {t: min(m) for t, m in unique.items()}
         for theta, mags in unique.items():
             # Reference the map to classify actions as explored or unexplored
             mag = min(mags)
-            # 贴墙惩罚：当前方向与相邻方向深度差异过大时降权
-            theta_idx = sorted_thetas.index(theta)
-            neighbor_mags = []
-            if theta_idx > 0:
-                neighbor_mags.append(theta_to_min_mag[sorted_thetas[theta_idx - 1]])
-            if theta_idx < len(sorted_thetas) - 1:
-                neighbor_mags.append(theta_to_min_mag[sorted_thetas[theta_idx + 1]])
-            if neighbor_mags and min(neighbor_mags) > 0 and mag / min(neighbor_mags) > 3.0:
-                mag = mag * 0.5
             cart = [self.e_i_scaling*mag*np.sin(theta), 0, -self.e_i_scaling*mag*np.cos(theta)]
             global_coords = local_to_global(agent_state.position, agent_state.rotation, cart)
             grid_coords = self._global_to_grid(global_coords)
@@ -328,9 +317,6 @@ class VLMNavAgent(Agent):
         if (out == [] or max(out, key=lambda x: x[0])[0] < self.cfg['min_action_dist']) and (self.step_ndx - self.turned) < self.cfg['turn_around_cooldown']:
             return self._get_default_arrows()
         
-        if len(out) > 5:
-            out.sort(key=lambda x: abs(x[1]))
-            out = out[:5]
         out.sort(key=lambda x: x[1])
         return [(mag, theta) for mag, theta, _ in out]
 
@@ -735,8 +721,6 @@ class WMNavAgent(VLMNavAgent):
         self.step_ndx = 0
         self.init_pos = None
         self.turned = -self.cfg['turn_around_cooldown']
-        self.step_memory = deque(maxlen=5)  # 最近5步摘要
-        self.door_history = []               # 经过的门（带坐标和门后场景）
 
         # ── 模块一: 语义先验 ──
         self.target_scene_prior = ""
@@ -753,92 +737,17 @@ class WMNavAgent(VLMNavAgent):
 
         # ── 模块三: 空间记忆 & 鲁棒兜底 ──
         self.known_target_coords = None
-        self._target_blocked = False
-        self._target_blocked_angle = ""    # 目标对应的全景角度，如 "90"
-        self._target_blocked_dist = 0.0
         self.position_history = deque(maxlen=8)
         self.stuck_counter = 0
         self.recovery_8_dirs = []
         self._recovery_active = False
         self._consecutive_stop_calls = 0
-        self.experience_hints = [] 
-        self.consecutive_path_failures = 0
-        self.last_action_polar = None
 
         self.ActionVLM.reset()
         self.PlanVLM.reset()
         self.PredictVLM.reset()
         self.GoalVLM.reset()
-    def _record_step_memory(self, agent_state, step_metadata, subtask,
-                            action_response=''):
-        pos = agent_state.position
-        scene = getattr(self, 'current_scene_type', 'unknown')
 
-        entry = {
-            'step': self.step_ndx,
-            'position': [round(float(pos[0]), 1), round(float(pos[2]), 1)],
-            'scene': scene,
-            'subtask': subtask,
-            'action': step_metadata.get('action_number', -10),
-        }
-        self.step_memory.append(entry)
-
-        # 检测是否经过了门
-        door_keywords = ['door', 'doorway', 'through the door', 'enter the room']
-        combined_text = (str(subtask) + ' ' + str(action_response)).lower()
-        if any(kw in combined_text for kw in door_keywords):
-            # 去重：距离上一个记录的门 < 2m 就不重复记录
-            new_pos = np.array([pos[0], pos[2]])
-            is_dup = False
-            for existing in self.door_history:
-                if np.linalg.norm(new_pos - np.array(existing['position'])) < 2.0:
-                    is_dup = True
-                    break
-            if not is_dup:
-                self.door_history.append({
-                    'step': self.step_ndx,
-                    'position': [round(float(pos[0]), 1), round(float(pos[2]), 1)],
-                    'scene': scene,
-                })
-                logging.info(f"[StepMemory] Door recorded at ({pos[0]:.1f}, {pos[2]:.1f}), scene={scene}")
-    def _format_step_memory_prompt(self) -> str:
-        parts = []
-
-        # 最近5步轨迹
-        if self.step_memory:
-            lines = []
-            for e in self.step_memory:
-                lines.append(
-                    f"  Step {e['step']}: at ({e['position'][0]}, {e['position'][1]}), "
-                    f"scene={e['scene']}, subtask=\"{e['subtask']}\""
-                )
-            parts.append(
-                "[RECENT TRAJECTORY] The agent's last few steps:\n"
-                + "\n".join(lines) + "\n"
-                "AVOID choosing directions that lead back to these recent locations."
-            )
-
-        # 门历史（带坐标，VLM 靠坐标区分不同的门）
-        if self.door_history:
-            recent_doors = self.door_history[-8:]
-            lines = []
-            for d in recent_doors:
-                lines.append(
-                    f"  Step {d['step']}: door at ({d['position'][0]}, {d['position'][1]}), "
-                    f"room inside: {d['scene']}"
-                )
-            parts.append(
-                "[EXPLORED DOORS] Doors the agent has already entered:\n"
-                + "\n".join(lines) + "\n"
-                "If you see a door near the SAME COORDINATES as one listed above, "
-                "that door has been explored — score it LOW (0-2).\n"
-                "If you see a door at DIFFERENT coordinates not listed above, "
-                "it is a NEW unexplored door — score it >= 8."
-            )
-
-        if not parts:
-            return ""
-        return "\n\n" + "\n\n".join(parts)
     def _initialize_vlms(self, cfg: dict):
         vlm_cls = globals()[cfg['model_cls']]
         system_instruction = (
@@ -1278,52 +1187,8 @@ class WMNavAgent(VLMNavAgent):
         goal_mask = np.all(temp_map == WHITE, axis=-1)
 
         return global_goal, goal_mask
-    
-
-
-
-    def mark_direction_failed(self, agent_state, r, theta):
-        """将导航失败的方向在 cvalue_map 中标记为不可达"""
-        local_coords = np.array([r * np.sin(theta), 0, -r * np.cos(theta)])
-        global_coords = local_to_global(agent_state.position, agent_state.rotation, local_coords)
-        point = self._global_to_grid(global_coords)
-        radius_px = int(1.0 * self.scale)
-        h, w = self.cvalue_map.shape[:2]
-        y1 = max(0, point[1] - radius_px)
-        y2 = min(h, point[1] + radius_px)
-        x1 = max(0, point[0] - radius_px)
-        x2 = min(w, point[0] + radius_px)
-        self.cvalue_map[y1:y2, x1:x2] = 0.0
-        logging.info(f"[PathFail] Marked direction theta={theta:.2f} as failed in cvalue_map")
 
     def _choose_action(self, obs: dict):
-
-        # 连续路径失败强制转向
-        if self.consecutive_path_failures >= 2:
-            logging.info("[PathFail] Consecutive failures >= 2, forcing turn around")
-            self.consecutive_path_failures = 0
-            self.turned = self.step_ndx
-            agent_action = PolarAction(0, np.pi)
-            step_metadata = {
-                'action_number': 0,
-                'success': 1,
-                'model': self.ActionVLM.name,
-                'agent_location': obs['agent_state'].position,
-                'called_stopping': False,
-                'object': obs['goal']
-            }
-            metadata = {
-                'step_metadata': step_metadata,
-                'logging_data': {'ACTION_NUMBER': 0, 'ACTION_PROMPT': 'FORCED_TURN', 'ACTION_RESPONSE': 'FORCED_TURN'},
-                'a_final': {},
-                'images': {'color_sensor': obs['color_sensor'].copy()},
-                'step': self.step_ndx
-            }
-            self.step_ndx += 1
-            return agent_action, metadata
-
-
-
         agent_state = obs['agent_state']
         goal = obs['goal']
         plan_visible = obs['goal_flag']
@@ -1425,13 +1290,6 @@ class WMNavAgent(VLMNavAgent):
             'images': images,
             'step': self.step_ndx
         }
-        self._record_step_memory(
-            agent_state,
-            step_metadata,
-            obs.get('subtask', ''),
-            action_response=logging_data.get('ACTION_RESPONSE', '')
-        )
-        self.last_action_polar = agent_action
         return agent_action, metadata
 
     def _eval_response(self, response: str):
@@ -1501,15 +1359,6 @@ class WMNavAgent(VLMNavAgent):
         _extra_predict_prompt = ""
         if hasattr(self, '_room_exhausted') and self._room_exhausted:
             _extra_predict_prompt += self.get_exhaustion_prompt_override()
-        if hasattr(self, '_room_mismatch_blocked') and self._room_mismatch_blocked:
-            _extra_predict_prompt += (
-                f"\n[SCENE MISMATCH] Current room type is '{self.current_scene_type}', "
-                f"but the target is typically found in: {self.prior_likely_rooms}. "
-                f"This room is WRONG. Score all directions going deeper into this room as 0. "
-                f"Score any exit direction as 5-6."
-            )
-
-
         if hasattr(self, 'stuck_counter'):
             _stuck_level = self.detect_stuck()
             if _stuck_level == 1:
@@ -1643,62 +1492,6 @@ class WMNavAgent(VLMNavAgent):
 
         return goal_flag, subtask
 
-    def load_experience(self, goal: str, experience_path: str = None):
-        """
-        从磁盘加载目标物的历史经验提示。
-        所有类别的经验存储在同一个 JSON 文件中，key 为目标物类别名。
-
-        Args:
-            goal: 目标物类别名，如 'chair', 'tv screen'
-            experience_path: JSON 文件路径，默认从环境变量 EXPERIENCE_PATH 读取，
-                            若未设置则使用 'experiences.json'
-        """
-        if experience_path is None:
-            experience_path = os.environ.get("EXPERIENCE_PATH", "experiences.json")
-
-        self.experience_hints = []
-
-        if not os.path.exists(experience_path):
-            logging.info(f"[Experience] 经验文件不存在: {experience_path}")
-            return
-
-        try:
-            with open(experience_path, 'r', encoding='utf-8') as f:
-                all_experiences = _json.load(f)
-        except Exception as e:
-            logging.warning(f"[Experience] 加载经验文件失败: {e}")
-            return
-
-        # 尝试多种 key 格式匹配：原始名、小写、空格转下划线
-        key = goal.strip().lower()
-        hints = all_experiences.get(key, None)
-        if hints is None:
-            key_alt = key.replace(" ", "_")
-            hints = all_experiences.get(key_alt, None)
-        if hints is None:
-            key_alt2 = key.replace("_", " ")
-            hints = all_experiences.get(key_alt2, None)
-
-        self.experience_hints = hints if isinstance(hints, list) else []
-        if self.experience_hints:
-            logging.info(f"[Experience] 为 '{goal}' 加载了 {len(self.experience_hints)} 条经验")
-        else:
-            logging.info(f"[Experience] 未找到 '{goal}' 的经验记录")
-
-    def _format_experience_prompt(self) -> str:
-        """
-        将已加载的经验提示格式化为可拼接到 prompt 末尾的文本段落。
-        如果没有经验，返回空字符串（不影响原有 prompt）。
-        """
-        if not self.experience_hints:
-            return ""
-        hints_text = "\n".join(f"- {h}" for h in self.experience_hints)
-        return (
-            "\n\n[EXPERIENCE FROM PREVIOUS EPISODES] "
-            "The following lessons were learned from past navigation attempts for this target. "
-            "You MUST follow these carefully to avoid repeating the same mistakes:\n"
-            f"{hints_text}\n"
-        )
 
     # ═══════════════════════════════════════════════════════════════════
     # 模块一: 语义记忆与先验引导
@@ -1858,7 +1651,7 @@ class WMNavAgent(VLMNavAgent):
 
     def check_room_exhaustion(self, agent_state):
         mean_cv, coverage = self._compute_local_cvalue_stats(agent_state)
-        self._room_exhausted = (mean_cv < 4.5 and coverage > 0.6)
+        self._room_exhausted = (mean_cv < 3.0 and coverage > 0.6)
         if self._room_exhausted:
             logging.info(f"[WorkingMemory] Room exhausted: mean_cvalue={mean_cv:.2f}, coverage={coverage:.2f}")
         return self._room_exhausted
@@ -1867,12 +1660,11 @@ class WMNavAgent(VLMNavAgent):
         if not self._room_exhausted:
             return ""
         return (
-            "\n[CRITICAL OVERRIDE] The current room has been FULLY SEARCHED. "
-            "The target object is CONFIRMED NOT HERE. "
-            "You MUST score ALL directions leading deeper into this room as 0. "
-            "You MUST score ANY exit (door, hallway, corridor, opening to another area) as 5 or 6. "
-            "If no exit is visible, score the direction with the most open space highest. "
-            "DO NOT explore this room further under any circumstances."
+            "\n[OVERRIDE] The current room/area has been thoroughly searched and "
+            "the target was NOT found here. You MUST prioritize directions that lead "
+            "OUT of this room — look for doors, hallways, corridors, or openings to "
+            "other areas. Assign score >= 8 to any exit direction and score 0 to "
+            "directions deeper into this already-explored room."
         )
 
     def detect_scene_type_from_vlm(self, image, goal):
@@ -1982,7 +1774,7 @@ class WMNavAgent(VLMNavAgent):
         2. 提高所有未探索方向的 cvalue（引导去找预期场景）
         3. 如果有门记忆，优先引导回到门的方向（去其他房间找预期场景）
         """
-        if self.steps_since_door_entry < 1:
+        if self.steps_since_door_entry < 3:
             return False
         if not self._is_scene_mismatch():
             return False
@@ -2055,105 +1847,98 @@ class WMNavAgent(VLMNavAgent):
 
     def apply_target_anchor_bias(self, agent_state):
         """
-        每步调用。根据当前位置和朝向重新计算目标方位。
-        可达 → cvalue锚定；不可达 → 记录方位信息供prompt使用。
+        障碍物感知的目标锚定偏置：
+        
+        原方法：直接给目标正方向 cvalue=10，不管该方向是否有墙
+        新方法：从目标方向开始，向两侧扫描可通行方向，给最优方向加分
+        
+        搜索逻辑：
+        目标正方向 → 左偏30° → 右偏30° → 左偏60° → 右偏60° → ...
+        评分逻辑：
+        偏移0° → 10分, 偏移30° → 8分, 偏移60° → 6分, 偏移90° → 4分
         """
         if self.known_target_coords is None:
-            self._target_blocked = False
-            self._target_blocked_angle = ""
-            self._target_blocked_dist = 0.0
             return
-
-        agent_pos = agent_state.position
-        target = self.known_target_coords
-        dx = target[0] - agent_pos[0]
-        dz = target[2] - agent_pos[2]
+        
+        dx = self.known_target_coords[0] - agent_state.position[0]
+        dz = self.known_target_coords[2] - agent_state.position[2]
         dist = np.sqrt(dx * dx + dz * dz)
-
         if dist < 0.3:
-            self._target_blocked = False
             return
 
-        # 计算目标相对于 agent 当前朝向的角度
+        # 计算目标相对于 agent 前方的角度
         target_angle_world = np.arctan2(dx, -dz)
-        forward = habitat_sim.utils.quat_rotate_vector(
-            agent_state.rotation, habitat_sim.geo.FRONT
-        )
+        forward = habitat_sim.utils.quat_rotate_vector(agent_state.rotation, habitat_sim.geo.FRONT)
         agent_angle_world = np.arctan2(forward[0], -forward[2])
         relative_yaw = target_angle_world - agent_angle_world
         relative_yaw = (relative_yaw + np.pi) % (2 * np.pi) - np.pi
-        relative_deg = np.degrees(relative_yaw)
 
-        # 映射到最近的30°方向索引
-        target_dir_idx = int(round(relative_deg / 30)) % 12
+        # 映射到最近的30°方向索引 (0~11)
+        target_dir_idx = int(round(np.degrees(relative_yaw) / 30)) % 12
         target_angle_key = str(target_dir_idx * 30)
 
-        # 判断可达性
-        direct_reachable = self._check_direction_reachable(
-            target_dir_idx, agent_state, min_reach_dist=1.0
-        )
+        # 从目标方向开始，向两侧搜索可通行方向
+        # 最大搜索范围 ±90°（3格）
+        search_offsets = [0, 1, -1, 2, -2, 3, -3]
+        
+        chosen_key = None
+        chosen_score = 0.0
 
-        if direct_reachable:
-            self._target_blocked = False
-            self._target_blocked_angle = ""
-            self._target_blocked_dist = 0.0
-            if target_angle_key in self.panoramic_mask and np.any(self.panoramic_mask[target_angle_key]):
-                mask = self.panoramic_mask[target_angle_key]
-                self.cvalue_map[mask] = np.maximum(self.cvalue_map[mask], 10.0)
-            logging.info(
-                f"[TargetGuide] REACHABLE -> anchor {target_angle_key} deg, "
-                f"dist={dist:.2f}m"
+        for offset in search_offsets:
+            check_idx = (target_dir_idx + offset) % 12
+            angle_key = str(check_idx * 30)
+
+            # 检查该方向是否存在可通行区域
+            if angle_key not in self.panoramic_mask:
+                continue
+            if not np.any(self.panoramic_mask[angle_key]):
+                continue
+            
+            # 进一步检查：该方向是否有有效通行距离（effective_mask）
+            has_effective_path = (
+                angle_key in self.effective_mask 
+                and np.any(self.effective_mask[angle_key])
             )
+            
+            if has_effective_path:
+                # 偏离目标方向越少，分数越高
+                chosen_score = max(10.0 - abs(offset) * 2.0, 4.0)
+                chosen_key = angle_key
+                break
+        
+        # 如果 effective_mask 都不通，退而求其次用 panoramic_mask
+        if chosen_key is None:
+            for offset in search_offsets:
+                check_idx = (target_dir_idx + offset) % 12
+                angle_key = str(check_idx * 30)
+                if angle_key in self.panoramic_mask and np.any(self.panoramic_mask[angle_key]):
+                    chosen_score = max(10.0 - abs(offset) * 2.0, 4.0)
+                    chosen_key = angle_key
+                    break
+
+        # 应用偏置
+        if chosen_key is not None:
+            mask = self.panoramic_mask[chosen_key]
+            self.cvalue_map[mask] = np.maximum(
+                self.cvalue_map[mask], chosen_score
+            )
+            
+            if chosen_key != target_angle_key:
+                logging.info(
+                    f"[SpatialMemory] Target dir {target_angle_key}° BLOCKED, "
+                    f"rerouted to {chosen_key}° (score={chosen_score:.1f}, dist={dist:.2f}m)"
+                )
+            else:
+                logging.info(
+                    f"[SpatialMemory] Target anchor bias -> {chosen_key}° "
+                    f"(score={chosen_score:.1f}, dist={dist:.2f}m)"
+                )
         else:
-            self._target_blocked = True
-            self._target_blocked_angle = target_angle_key
-            self._target_blocked_dist = dist
-            logging.info(
-                f"[TargetGuide] BLOCKED at {target_angle_key} deg, "
-                f"dist={dist:.2f}m. No cvalue change."
+            logging.warning(
+                f"[SpatialMemory] No navigable direction found near target "
+                f"(target_dir={target_angle_key}°, dist={dist:.2f}m)"
             )
-    def _check_direction_reachable(self, dir_idx, agent_state, min_reach_dist=1.0):
-        """
-        检查某方向的 effective_mask 中最远可通行距离是否 >= min_reach_dist 米。
-        """
-        angle_key = str(dir_idx * 30)
-        if angle_key not in self.effective_mask:
-            return False
-        mask = self.effective_mask[angle_key]
-        if not np.any(mask):
-            return False
 
-        agent_coords = np.array(self._global_to_grid(agent_state.position))
-        ys, xs = np.where(mask)
-        if len(xs) == 0:
-            return False
-
-        dists_px = np.sqrt(
-            (xs.astype(np.float32) - agent_coords[0]) ** 2 +
-            (ys.astype(np.float32) - agent_coords[1]) ** 2
-        )
-        max_dist_m = float(np.max(dists_px)) / self.scale
-        return max_dist_m >= min_reach_dist
-    def _format_target_memory_prompt(self) -> str:
-        """
-        目标不可达时，生成包含全景角度的方位提示。
-        每步 apply_target_anchor_bias 会重新计算角度，所以这里的角度
-        始终是基于 agent 当前朝向的。
-        """
-        if not self._target_blocked or not self._target_blocked_angle:
-            return ""
-
-        return (
-            f"\n\n[TARGET MEMORY] You have previously detected the target "
-            f"at the {self._target_blocked_angle}-degree direction in the "
-            f"panoramic view, approximately {self._target_blocked_dist:.1f}m "
-            f"away. However, the direct path in that direction is BLOCKED by "
-            f"a wall, glass, or obstacle. You CANNOT go through walls or glass. "
-            f"You MUST find an alternative route: look for doors, hallways, "
-            f"openings, or corridors that could lead you around to the target. "
-            f"When choosing between multiple exits, prefer the one that leads "
-            f"toward the {self._target_blocked_angle}-degree direction."
-        )
     def update_position_history(self, agent_state):
         pos = np.array([agent_state.position[0], agent_state.position[2]])
         self.position_history.append(pos)
@@ -2172,7 +1957,7 @@ class WMNavAgent(VLMNavAgent):
             self.recovery_8_dirs = []
             return 0
 
-        if self.stuck_counter >= 3:
+        if self.stuck_counter >= 6:
             return 2
         elif self.stuck_counter >= 1:
             return 1
@@ -2221,28 +2006,18 @@ class WMNavAgent(VLMNavAgent):
             )
             return location_prompt
         if prompt_type == 'predicting':
-            evaluator_prompt = (
-                f"The agent has been tasked with navigating to a {goal.upper()}. The agent has sent you the panoramic image describing your surrounding environment, each image contains a label indicating the relative rotation angle(30, 90, 150, 210, 270, 330) with red fonts. "
-                f'Your job is to assign a score to each direction (ranging from 0 to 10), judging whether this direction is worth exploring. The following criteria should be used: '
-                f'To help you describe the layout of your surrounding, please follow my step-by-step instructions: '
-                f'(1) If there is no visible way to move to other areas and it is clear that the target is not in sight, assign a score of 0. Note a chair must have a backrest and a chair is not a stool. Note a chair is NOT sofa(couch) which is NOT a bed. '
-                f'(2) If you can ACTUALLY SEE a {goal} in the image for that direction (not just guessing it might exist nearby), assign a score of 10. '
-                f'CRITICAL: If your explanation describes a {goal} as physically visible in that direction (e.g., "there is a chair", "a chair is visible", "with a chair"), you MUST give a score of 10. '
-                f'It is WRONG to describe seeing a {goal} but give a score less than 10. '
-                f'However, do NOT give 10 for mere speculation like "a chair might be in the adjacent room" — that is just a guess, not actual detection. '
-                f'(3) If there is a way to move to another area, assign a score based on your estimate of the likelihood of finding a {goal}, using your common sense. Moving to another area means there is a turn in the corner, an open door, a hallway, etc. Note you CANNOT GO THROUGH CLOSED DOORS. CLOSED DOORS and GOING UP OR DOWN STAIRS are not considered. '
-                f'Scoring priority: unexplored open door (>= 8) > unknown hallway or corridor (5-7) > direction deeper into current room (0-3). '
-                "For each direction, provide an explanation for your assigned score. Format your answer in the json {'30': {'Score': <The score(from 0 to 10) of angle 30>, 'Explanation': <An explanation for your assigned score.>}, '90': {...}, '150': {...}, '210': {...}, '270': {...}, '330': {...}}. "
-                "Answer Example: {'30': {'Score': 0, 'Explanation': 'Dead end with a recliner. No sign of a bed or any other room.'}, '90': {'Score': 2, 'Explanation': 'Dining area. It is possible there is a doorway leading to other rooms, but bedrooms are less likely to be directly adjacent to dining areas.'}, ..., '330': {'Score': 2, 'Explanation': 'Living room area with a recliner. Similar to 270, there is a possibility of other rooms, but no strong indication of a bedroom.'}} "
-                f'(4) DOOR-FIRST RULE: If you see an OPEN DOOR that is NOT listed in [EXPLORED DOORS] below '
-                f'(check by comparing coordinates — different coordinates means a different door), '
-                f'score that direction >= 8. Do NOT deprioritize a door just because you visited '
-                f'a similar room type before — two bedrooms at different locations are different rooms. '
-                f'Hallways and corridors should be scored LOWER than unexplored doors. '
-                f'(5) NO-BACKTRACK RULE: Check [RECENT TRAJECTORY] below. If a direction leads back toward '
-                f'a location you visited in the last few steps, score it 0-2. '
-            )
-            return evaluator_prompt + self._format_experience_prompt() + self._format_target_memory_prompt()+ self._format_step_memory_prompt()
+            evaluator_prompt = (f"The agent has been tasked with navigating to a {goal.upper()}. The agent has sent you the panoramic image describing your surrounding environment, each image contains a label indicating the relative rotation angle(30, 90, 150, 210, 270, 330) with red fonts. "
+            f'Your job is to assign a score to each direction (ranging from 0 to 10), judging whether this direction is worth exploring. The following criteria should be used: '
+            f'To help you describe the layout of your surrounding,  please follow my step-by-step instructions: '
+            f'(1) If there is no visible way to move to other areas and it is clear that the target is not in sight, assign a score of 0. Note a chair must have a backrest and a chair is not a stool. Note a chair is NOT sofa(couch) which is NOT a bed. '
+            f'(2) If you can ACTUALLY SEE a {goal} in the image for that direction (not just guessing it might exist nearby), assign a score of 10. '
+            f'CRITICAL: If your explanation describes a {goal} as physically visible in that direction (e.g., "there is a chair", "a chair is visible", "with a chair"), you MUST give a score of 10. '
+            f'It is WRONG to describe seeing a {goal} but give a score less than 10. '
+            f'However, do NOT give 10 for mere speculation like "a chair might be in the adjacent room" — that is just a guess, not actual detection. '
+            f'(3) If there is a way to move to another area, assign a score based on your estimate of the likelihood of finding a {goal}, using your common sense. Moving to another area means there is a turn in the corner, an open door, a hallway, etc. Note you CANNOT GO THROUGH CLOSED DOORS. CLOSED DOORS and GOING UP OR DOWN STAIRS are not considered. '
+            "For each direction, provide an explanation for your assigned score. Format your answer in the json {'30': {'Score': <The score(from 0 to 10) of angle 30>, 'Explanation': <An explanation for your assigned score.>}, '90': {...}, '150': {...}, '210': {...}, '270': {...}, '330': {...}}. "
+            "Answer Example: {'30': {'Score': 0, 'Explanation': 'Dead end with a recliner. No sign of a bed or any other room.'}, '90': {'Score': 2, 'Explanation': 'Dining area. It is possible there is a doorway leading to other rooms, but bedrooms are less likely to be directly adjacent to dining areas.'}, ..., '330': {'Score': 2, 'Explanation': 'Living room area with a recliner.  Similar to 270, there is a possibility of other rooms, but no strong indication of a bedroom.'}}")
+            return evaluator_prompt
         if prompt_type == 'planning':
             if reason != '' and subtask != '{}':
                 planning_prompt = (f"The agent has been tasked with navigating to a {goal.upper()}. The agent has sent you the following elements:"
@@ -2263,7 +2038,7 @@ class WMNavAgent(VLMNavAgent):
                 f'(2) If the {goal} is not found, describe where you are going next to be more likely to find clues to the the {goal} and analyze the room type and think about whether the {goal} is likely to occur in that direction. Note you need to pay special attention to open doors and hallways, as they can lead to other unseen rooms. Note GOING UP OR DOWN STAIRS is an option. '
                 "Format your answer in the json {{'Subtask': <Where you are going next>, 'Flag': <Whether the target is in your view, True or False>}}. "
                 "Answer Example: {{'Subtask': 'Go to the hallway', 'Flag': False}} or {{'Subtask': "+f"'Go to the {goal}'"+", 'Flag': True}} or {{'Subtask': 'Go to the open door', 'Flag': True}}")
-            return planning_prompt + self._format_experience_prompt() + self._format_target_memory_prompt()
+            return planning_prompt
         if prompt_type == 'action':
             if subtask != '{}':
                 action_prompt = (
@@ -2281,6 +2056,6 @@ class WMNavAgent(VLMNavAgent):
                     f"First, tell me what you see in your sensor observation, and if you have any leads on finding the {goal.upper()}. Second, tell me which general direction you should go in. "
                     "Lastly, explain which action acheives that best, and return it as {{'action': <action_key>}}. Note you CANNOT GO THROUGH CLOSED DOORS, and you DO NOT NEED TO GO UP OR DOWN STAIRS"
                 )
-            return action_prompt + self._format_experience_prompt() + self._format_target_memory_prompt()+ self._format_step_memory_prompt()
+            return action_prompt
 
         raise ValueError('Prompt type must be goal, predicting, planning, or action')

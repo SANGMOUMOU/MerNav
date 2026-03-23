@@ -12,7 +12,7 @@ import json as _json
 from simWrapper import PolarAction
 from utils import *
 from api import *
-
+#版本三所用的agent代码，需要使用env_3文件和config中的WMNav_2.yaml配置文件才能运行，api_2文件
 class Agent:
     def __init__(self, cfg: dict):
         pass
@@ -1296,6 +1296,12 @@ class WMNavAgent(VLMNavAgent):
     def _eval_response(self, response: str):
         """Converts the VLM response string into a dictionary, if possible"""
         import re
+        
+        # ==========================================
+        # 核心修改点：将标准 JSON 关键字转换为 Python 关键字
+        # ==========================================
+        response = response.replace('true', 'True').replace('false', 'False').replace('null', 'None')
+        
         result = re.sub(r"(?<=[a-zA-Z])'(?=[a-zA-Z])", "\\'", response)
         try:
             eval_resp = ast.literal_eval(result[result.index('{') + 1:result.rindex('}')]) # {{}}
@@ -1387,7 +1393,7 @@ class WMNavAgent(VLMNavAgent):
     def _merge_evalue(arr, num, alpha=0.4):
         """加权平均，允许历史低分被新高分拉回"""
         # 原来：return np.minimum(arr, num)  # 只降不升
-        return arr * (1 - alpha) + num * alpha
+        return np.minimum(arr, num)
 
     def update_curiosity_value(self, explorable_value, reason):
         try:

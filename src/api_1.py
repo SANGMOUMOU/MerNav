@@ -9,7 +9,7 @@ import os
 logging.getLogger("openai").setLevel(logging.ERROR)
 logging.getLogger("httpx").setLevel(logging.ERROR)
 
-
+#原始版本的api调用文件，相较于版本一的api文件，缺乏对纯文本调用的支持（call_text_only方法）。
 
 def encode_image(image):
     try:
