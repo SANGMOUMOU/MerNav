@@ -9,7 +9,7 @@ import os
 logging.getLogger("openai").setLevel(logging.ERROR)
 logging.getLogger("httpx").setLevel(logging.ERROR)
 
-#版本一之后所使用的api文件，区别在于相较于原始版本的api文件，增加了对纯文本调用的支持（call_text_only方法）。
+#原始版本的api调用文件，相较于版本一的api文件，缺乏对纯文本调用的支持（call_text_only方法）。
 
 def encode_image(image):
     try:
@@ -123,31 +123,6 @@ class GeminiVLM:
             return "GEMINI API ERROR"
         return response.choices[0].message.content
 
-    def call_text_only(self, text_prompt: str):
-        """Pure text call without any image input."""
-        try:
-            messages = []
-            if self.system_instruction:
-                messages.append({"role": "system", "content": self.system_instruction})
-            messages.append({
-                "role": "user",
-                "content": [{"type": "text", "text": text_prompt}],
-            })
-            response = self.client.chat.completions.create(
-                model=self.name,
-                messages=messages,
-                max_tokens=500,
-                temperature=0,
-                top_p=1,
-                stream=False,
-            )
-            self.spend += (response.usage.prompt_tokens * self.cost_per_input_token +
-                           response.usage.completion_tokens * self.cost_per_output_token)
-        except Exception as e:
-            print(f"GEMINI API ERROR (text_only): {e}")
-            return "GEMINI API ERROR"
-        return response.choices[0].message.content
-
     def reset(self):
         """
         Reset the context state of the VLM agent.
@@ -249,30 +224,6 @@ class QwenVLM:
         except Exception as e:
             print(f"GEMINI API ERROR: {e}")
             return "GEMINI API ERROR"
-        return response.choices[0].message.content
-
-    def call_text_only(self, text_prompt: str):
-        """Pure text call without any image input."""
-        try:
-            messages = []
-            if self.system_instruction:
-                messages.append({"role": "system", "content": self.system_instruction})
-            messages.append({
-                "role": "user",
-                "content": [{"type": "text", "text": text_prompt}],
-            })
-            response = self.client.chat.completions.create(
-                model=self.name,
-                messages=messages,
-                max_tokens=500,
-                temperature=0,
-                top_p=1,
-                stream=False,
-            )
-            self.spend += (response.usage.prompt_tokens + response.usage.completion_tokens)
-        except Exception as e:
-            print(f"QWEN API ERROR (text_only): {e}")
-            return "QWEN API ERROR"
         return response.choices[0].message.content
 
     def reset(self):

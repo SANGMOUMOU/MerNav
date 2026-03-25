@@ -275,7 +275,7 @@ class WMNavEnv(Env):
             objnav_path = 'objectnav_hm3d_v1'
         elif self.cfg['dataset']  == 'hm3d_v0.2':
             scene_config_path = 'hm3d_v0.2/hm3d_annotated_basis.scene_dataset_config.json'
-            objnav_path = 'objectnav_hm3d_v2'
+            objnav_path = 'objectnav_hm3d_v0.2'
         elif self.cfg['dataset']  == 'mp3d':
             scene_config_path = 'mp3d/mp3d_annotated_basis.scene_dataset_config.json'
             objnav_path = 'objectnav_mp3d'

@@ -10,7 +10,7 @@ import concurrent.futures
 from simWrapper import PolarAction
 from utils import *
 from api import *
-#原始版本所用的agent代码，需要使用env_1文件和config中的WMNav_1.yaml配置文件才能运行，api_1文件
+#版本一：原始版本所用的agent代码，需要使用env_1文件和config中的WMNav_1.yaml配置文件才能运行，api_1文件
 class Agent:
     def __init__(self, cfg: dict):
         pass
